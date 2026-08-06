@@ -87,10 +87,17 @@ const pick = (row, candidates) => {
   return undefined;
 };
 
-// ---------- workbook parsing ----------
+// ---------- file parsing (CSV or Excel) ----------
 async function parseWorkbook(file) {
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { cellDates: true });
+  const isCsv = /\.(csv|tsv|txt)$/i.test(file.name || "");
+  let wb;
+  if (isCsv) {
+    const text = await file.text();
+    wb = XLSX.read(text, { type: "string", cellDates: true });
+  } else {
+    const buf = await file.arrayBuffer();
+    wb = XLSX.read(buf, { cellDates: true });
+  }
   // pick the sheet with the most rows
   let best = wb.SheetNames[0];
   let bestCount = -1;
@@ -555,7 +562,7 @@ export default function ReconciliationTool() {
       setErrors((e) => ({ ...e, [which]: null }));
       saveShared(nextFiles);
     } catch (err) {
-      setErrors((e) => ({ ...e, [which]: "Couldn't read that file — is it a valid .xlsx?" }));
+      setErrors((e) => ({ ...e, [which]: "Couldn't read that file — is it a valid CSV or Excel file?" }));
     }
   }, [saveShared]);
 
@@ -642,6 +649,10 @@ export default function ReconciliationTool() {
             Commission <span style={{ color: "#5514b4" }}>Reconciliation</span>
           </h1>
           <p className="sub" style={{ margin: "6px 0 0" }}>Restricted test tool. Enter the access code.</p>
+          <p className="sub" style={{ margin: "6px 0 0", color: "#b3261e" }}>
+            Not connected to the database — this is local-only mode (no logins, uploads won't be saved or shared).
+            To turn on email/password logins + sharing, paste your Supabase anon key into App.jsx.
+          </p>
           <input
             type="password"
             value={pass}
@@ -689,6 +700,14 @@ export default function ReconciliationTool() {
           {errors.save && <span style={{ color: "#b3261e" }}> · {errors.save}</span>}
         </p>
 
+        {!supabase && (
+          <div className="banner">
+            <strong>Not connected to the database.</strong> Running in local mode — uploads work but are
+            <em> not saved or shared</em>, and there's no login. Paste your Supabase anon key into
+            <span className="mono"> App.jsx</span> (the <span className="mono">SUPABASE_ANON_KEY</span> line) and redeploy to switch on logins + sharing.
+          </div>
+        )}
+
         {/* uploads */}
         <div className="panel">
           <h2>1 · Upload exports</h2>
@@ -705,8 +724,8 @@ export default function ReconciliationTool() {
                   <div className="role">{role}</div>
                   <div className="desc">{desc}</div>
                   <label className={"file " + (f ? "reload" : "")}>
-                    {f ? "Replace file" : "Choose .xlsx"}
-                    <input type="file" accept=".xlsx,.xls" onChange={(e) => onFile(key, e.target.files[0])} />
+                    {f ? "Replace file" : "Choose CSV"}
+                    <input type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" onChange={(e) => onFile(key, e.target.files[0])} />
                   </label>
                   {f && (
                     <div className="status">
