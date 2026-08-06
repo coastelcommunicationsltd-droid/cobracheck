@@ -20,7 +20,8 @@ const SUPABASE_ANON_KEY = "PASTE-YOUR-ANON-KEY-HERE";
 
 const supabase =
   SUPABASE_URL.startsWith("https://") && !SUPABASE_ANON_KEY.startsWith("PASTE")
-    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    ? createClient(SUPABASE_URL, 5aec59f4064781bc024c5bf87ac3db78398775e6f0ecf613e2ca76612506f9fa
+)
     : null;
 
 // a throwaway client for creating other people's logins WITHOUT signing the
