@@ -156,7 +156,7 @@ const KEEP_COLS = {
   netsuite: ["Opp ID", "Order ref", "Company Name", "Order Status", "Contract Value",
     "Item: Name (Grouped)", "Item Name", "Product GP", "Cobra Payment", "Item Paid",
     "Overpayment", "Accelerator?", "Admin Agent", "Customer Le", "Netsuite Date",
-    "Product Group 2", "Product Group2", "Product Group"],
+    "Product Group 2", "Product Group2", "Product Group", "Netsuite Ref"],
   cobra: ["Job Header", "Opty ID", "LE Code", "Customer Name", "Status", "Month",
     "Contract Value", "Commission Due", "Commission Paid", "Measure", "Plan Name",
     "Prod Code", "Closed Date", "Order Date"],
@@ -195,8 +195,19 @@ const nsRow = (r) => ({
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
   date: pick(r, ["Netsuite Date"]),
   productGroup2: firstDefined(pick(r, ["Product Group 2", "Product Group2"])),
+  netsuiteRef: firstDefined(pick(r, ["Netsuite Ref", "NetSuite Ref"])),
   raw: r,
 });
+
+// "BB - FTTP ACQ Hyperfast 5year" -> "BB";  "Data - BT Net Xsell" -> "Data"
+const productGroupOf = (itemName) => {
+  if (!itemName) return null;
+  const s = String(itemName);
+  const i = s.indexOf("-");
+  if (i <= 0) return null; // no dash -> no group (keeps the filter list clean)
+  const head = s.slice(0, i).trim();
+  return head || null;
+};
 
 const cobraRow = (r) => ({
   src: "cobra",
@@ -332,7 +343,9 @@ function reconcile(files, tol, period = "all") {
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
       period: monthKey(nsL[0]?.date) || monthKey(cbL[0]?.date) || monthKey(s5L[0]?.date) || null,
       product: firstDefined(nsL[0]?.product, cbL[0]?.product, s5L[0]?.product),
-      productGroup2: firstDefined(...nsL.map((x) => x.productGroup2)),
+      productGroup: productGroupOf(firstDefined(...nsL.map((x) => x.product))),
+      netsuiteRef: firstDefined(...nsL.map((x) => x.netsuiteRef)),
+      nsStatus: firstDefined(...nsL.map((x) => x.status)),
       status: firstDefined(nsL[0]?.status, cbL[0]?.status, s5L[0]?.status),
       sch5Status: firstDefined(s5L[0]?.status),
       flags, matchState,
@@ -405,10 +418,10 @@ function downloadCSV(rows, filename) {
 const STYLES = `
 * { box-sizing: border-box; }
 .recon { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  color:#1b1636; background:#f5f5fa; min-height:100%; padding:22px; line-height:1.45; }
+  color:#1b1636; background:#f5f5fa; min-height:100%; padding:16px 14px; line-height:1.45; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .num { font-variant-numeric: tabular-nums; text-align:center; white-space:nowrap; }
-.wrap { max-width:1180px; margin:0 auto; }
+.wrap { max-width:100%; margin:0 auto; }
 .head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:2px; }
 .head h1 { font-size:22px; margin:0; letter-spacing:-.02em; }
 .head .accent { color:#5514b4; }
@@ -1217,21 +1230,27 @@ function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta,
 
 // ---------- Cross-Reference tab: order ref across all three sheets ----------
 function CrossReference({ records }) {
-  const [group2, setGroup2] = useState("all");
+  const [group, setGroup] = useState("all");
   const [sheets, setSheets] = useState("all");
+  const [paidView, setPaidView] = useState("show");
   const [sort, setSort] = useState({ col: "diff", dir: "desc" });
 
   const spread = (vals) => { const v = vals.filter((x) => x != null); if (!v.length) return 0; return Math.max(...v) - Math.min(...v); };
+  const isPaid = (r) => /paid/i.test(String(r.nsStatus || ""));
 
+  // GP delta: Cobra paid MINUS what we expected.
+  // positive = BT paid us more than expected (good, green); negative = underpaid (bad, red)
   const enriched = records.map((r) => ({
     ...r,
     sovSpread: spread([r.inNS ? r.nsSov : null, r.inSch5 ? r.s5Sov : null, r.inCobra ? r.cobraSov : null]),
-    gpDiff: (r.inNS ? r.expected : 0) - (r.inCobra ? r.paid : 0),
+    gpDiff: (r.inCobra ? r.paid : 0) - (r.inNS ? r.expected : 0),
     sheetCode: `${r.inNS ? "N" : "-"}${r.inCobra ? "C" : "-"}${r.inSch5 ? "S" : "-"}`,
     onAll: r.inNS && r.inCobra && r.inSch5,
+    paid: r.paid,
+    paidFlag: isPaid(r),
   }));
 
-  const groups = [...new Set(enriched.map((r) => r.productGroup2).filter(Boolean))].sort();
+  const groups = [...new Set(enriched.map((r) => r.productGroup).filter(Boolean))].sort();
 
   const bySheets = (r) => {
     if (sheets === "all") return true;
@@ -1245,17 +1264,24 @@ function CrossReference({ records }) {
     if (sheets === "noSch5") return !r.inSch5;
     return true;
   };
+  const byPaid = (r) => {
+    if (paidView === "only") return r.paidFlag;
+    if (paidView === "hide") return !r.paidFlag;
+    return true;
+  };
 
   const filtered = enriched.filter(
-    (r) => (group2 === "all" || (r.productGroup2 || "(blank)") === group2) && bySheets(r)
+    (r) => (group === "all" || (r.productGroup || "(blank)") === group) && bySheets(r) && byPaid(r)
   );
 
   const getVal = (r, col) => {
     switch (col) {
       case "order": return r.orderNum || "";
+      case "nsref": return r.netsuiteRef || "";
       case "company": return (r.company || "").toLowerCase();
       case "item": return (r.product || "").toLowerCase();
-      case "group2": return (r.productGroup2 || "").toLowerCase();
+      case "group": return (r.productGroup || "").toLowerCase();
+      case "status": return (r.nsStatus || "").toLowerCase();
       case "sheets": return r.sheetCode;
       case "nsSov": return r.inNS ? r.nsSov : null;
       case "s5Sov": return r.inSch5 ? r.s5Sov : null;
@@ -1291,25 +1317,26 @@ function CrossReference({ records }) {
   const shown = rows.slice(0, 1000);
   const cell = (v) => <span className="num mono">{gbp(v)}</span>;
   const diffCell = (v) => <span className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>{gbp(v)}</span>;
+  const selStyle = { padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 };
 
   const click = (col) =>
-    setSort((s) => ({ col, dir: s.col === col ? (s.dir === "asc" ? "desc" : "asc") : (["order", "company", "item", "group2", "sheets"].includes(col) ? "asc" : "desc") }));
+    setSort((s) => ({ col, dir: s.col === col ? (s.dir === "asc" ? "desc" : "asc") : (["order", "nsref", "company", "item", "group", "status", "sheets"].includes(col) ? "asc" : "desc") }));
   const H = ({ col, label, num }) => (
     <th className={num ? "num" : ""} style={{ cursor: "pointer", userSelect: "none" }} onClick={() => click(col)}>
-      {label}{sort.col === col ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+      {label}{sort.col === col ? (sort.dir === "asc" ? " \u25B2" : " \u25BC") : ""}
     </th>
   );
 
   return (
     <>
       <div className="panel">
-        <h2>Totals — SOV &amp; GP across the three sheets</h2>
+        <h2>Totals \u2014 SOV &amp; GP across the three sheets</h2>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead>
               <tr>
                 <th>Metric</th><th className="num">NetSuite</th><th className="num">Sch5</th><th className="num">Cobra</th>
-                <th className="num">NS − Cobra</th><th className="num">NS − Sch5</th>
+                <th className="num">Cobra \u2212 NS</th><th className="num">Sch5 \u2212 NS</th>
               </tr>
             </thead>
             <tbody>
@@ -1318,37 +1345,35 @@ function CrossReference({ records }) {
                 <td className="num mono">{gbp(T.nsSov)}</td>
                 <td className="num mono">{gbp(T.s5Sov)}</td>
                 <td className="num mono">{gbp(T.cbSov)}</td>
-                <td>{diffCell(T.nsSov - T.cbSov)}</td>
-                <td>{diffCell(T.nsSov - T.s5Sov)}</td>
+                <td>{diffCell(T.cbSov - T.nsSov)}</td>
+                <td>{diffCell(T.s5Sov - T.nsSov)}</td>
               </tr>
               <tr>
                 <td><strong>GP</strong> <span className="sub">(Product GP / Commission Paid)</span></td>
                 <td className="num mono">{gbp(T.nsGp)}</td>
-                <td className="num mono">—</td>
+                <td className="num mono">\u2014</td>
                 <td className="num mono">{gbp(T.cbGp)}</td>
-                <td>{diffCell(T.nsGp - T.cbGp)}</td>
-                <td className="num mono">—</td>
+                <td>{diffCell(T.cbGp - T.nsGp)}</td>
+                <td className="num mono">\u2014</td>
               </tr>
             </tbody>
           </table>
         </div>
-        <p className="note">Totals follow the filters below.</p>
+        <p className="note">Green = Cobra paid more than we expected. Red = paid less. Totals follow the filters below.</p>
       </div>
 
       <div className="panel">
         <h2 style={{ marginBottom: 10 }}>By order reference</h2>
         <div className="settings" style={{ marginBottom: 12 }}>
-          <span>Product Group 2:</span>
-          <select value={group2} onChange={(e) => setGroup2(e.target.value)}
-            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
-            <option value="all">All groups</option>
+          <span>Product:</span>
+          <select value={group} onChange={(e) => setGroup(e.target.value)} style={selStyle}>
+            <option value="all">All products</option>
             {groups.map((g) => <option key={g} value={g}>{g}</option>)}
             <option value="(blank)">(blank)</option>
           </select>
-          <span style={{ width: 14 }} />
+          <span style={{ width: 12 }} />
           <span>Appears on:</span>
-          <select value={sheets} onChange={(e) => setSheets(e.target.value)}
-            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+          <select value={sheets} onChange={(e) => setSheets(e.target.value)} style={selStyle}>
             <option value="all">Any sheet</option>
             <option value="all3">All three sheets</option>
             <option value="missing">Missing from at least one</option>
@@ -1359,10 +1384,17 @@ function CrossReference({ records }) {
             <option value="cbOnly">Cobra only</option>
             <option value="s5Only">Sch5 only</option>
           </select>
+          <span style={{ width: 12 }} />
+          <span>Paid orders:</span>
+          <select value={paidView} onChange={(e) => setPaidView(e.target.value)} style={selStyle}>
+            <option value="show">Show paid</option>
+            <option value="only">Show only paid</option>
+            <option value="hide">Do not show paid</option>
+          </select>
           <span style={{ color: "#8a8aa3" }}>{filtered.length} of {enriched.length} references</span>
         </div>
         <p className="note" style={{ marginTop: 0 }}>
-          Joined on order reference — <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
+          Joined on order reference \u2014 <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
           Click any column heading to sort.
         </p>
         <div style={{ overflowX: "auto" }}>
@@ -1370,9 +1402,11 @@ function CrossReference({ records }) {
             <thead>
               <tr>
                 <H col="order" label="Order ref" />
+                <H col="nsref" label="NetSuite ref" />
                 <H col="company" label="Company" />
                 <H col="item" label="Item name" />
-                <H col="group2" label="Product Group 2" />
+                <H col="group" label="Product" />
+                <H col="status" label="Order status" />
                 <H col="sheets" label="Sheets" num />
                 <H col="nsSov" label="NS SOV" num />
                 <H col="s5Sov" label="Sch5 SOV" num />
@@ -1387,16 +1421,18 @@ function CrossReference({ records }) {
               {shown.map((r) => (
                 <tr key={r.key}>
                   <td className="mono">{r.orderNum}</td>
+                  <td className="mono">{r.netsuiteRef || "\u2014"}</td>
                   <td>{r.company}</td>
-                  <td>{r.product || "—"}</td>
-                  <td>{r.productGroup2 || "—"}</td>
+                  <td>{r.product || "\u2014"}</td>
+                  <td>{r.productGroup || "\u2014"}</td>
+                  <td>{r.nsStatus || "\u2014"}</td>
                   <td className="num"><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
-                  <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">—</span>}</td>
-                  <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">—</span>}</td>
-                  <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">—</span>}</td>
+                  <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">\u2014</span>}</td>
+                  <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">\u2014</span>}</td>
+                  <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">\u2014</span>}</td>
                   <td>{diffCell(r.sovSpread)}</td>
-                  <td>{r.inNS ? cell(r.expected) : <span className="num sub">—</span>}</td>
-                  <td>{r.inCobra ? cell(r.paid) : <span className="num sub">—</span>}</td>
+                  <td>{r.inNS ? cell(r.expected) : <span className="num sub">\u2014</span>}</td>
+                  <td>{r.inCobra ? cell(r.paid) : <span className="num sub">\u2014</span>}</td>
                   <td>{diffCell(r.gpDiff)}</td>
                 </tr>
               ))}
