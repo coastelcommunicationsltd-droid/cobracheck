@@ -37,8 +37,22 @@ const PASSCODE = "BTLBDCSDTEST";
 const money = (v) => {
   if (v === null || v === undefined || v === "") return null;
   if (typeof v === "number") return isNaN(v) ? null : v;
-  const n = parseFloat(String(v).replace(/[£,\s]/g, ""));
-  return isNaN(n) ? null : n;
+  let s = String(v).trim();
+  if (!s) return null;
+  // accounting negatives: (1,234.56)
+  const bracketed = /^\(.*\)$/.test(s);
+  // strip EVERYTHING that isn't a digit, dot or minus — covers £, $, commas,
+  // non-breaking spaces, and mis-encoded symbols that arrive as "?" or "Â£"
+  s = s.replace(/[^0-9.\-]/g, "");
+  if (s === "" || s === "-" || s === ".") return null;
+  // keep only the first decimal point and a leading minus
+  const neg = s.startsWith("-") || bracketed;
+  s = s.replace(/-/g, "");
+  const parts = s.split(".");
+  s = parts.length > 1 ? parts[0] + "." + parts.slice(1).join("") : s;
+  const n = parseFloat(s);
+  if (isNaN(n)) return null;
+  return neg ? -n : n;
 };
 const sum = (arr) => arr.reduce((a, b) => a + (b || 0), 0);
 const normOrder = (v) => (v == null ? "" : String(v).toUpperCase().replace(/\s+/g, "").trim());
@@ -141,7 +155,8 @@ async function parseWorkbook(file) {
 const KEEP_COLS = {
   netsuite: ["Opp ID", "Order ref", "Company Name", "Order Status", "Contract Value",
     "Item: Name (Grouped)", "Item Name", "Product GP", "Cobra Payment", "Item Paid",
-    "Overpayment", "Accelerator?", "Admin Agent", "Customer Le", "Netsuite Date"],
+    "Overpayment", "Accelerator?", "Admin Agent", "Customer Le", "Netsuite Date",
+    "Product Group 2", "Product Group2", "Product Group"],
   cobra: ["Job Header", "Opty ID", "LE Code", "Customer Name", "Status", "Month",
     "Contract Value", "Commission Due", "Commission Paid", "Measure", "Plan Name",
     "Prod Code", "Closed Date", "Order Date"],
@@ -179,6 +194,7 @@ const nsRow = (r) => ({
   agent: firstDefined(pick(r, ["Admin Agent"])),
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
   date: pick(r, ["Netsuite Date"]),
+  productGroup2: firstDefined(pick(r, ["Product Group 2", "Product Group2"])),
   raw: r,
 });
 
@@ -315,6 +331,8 @@ function reconcile(files, tol, period = "all") {
       payDelta, recordDelta, dueVsPaid, sovDelta,
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
       period: monthKey(nsL[0]?.date) || monthKey(cbL[0]?.date) || monthKey(s5L[0]?.date) || null,
+      product: firstDefined(nsL[0]?.product, cbL[0]?.product, s5L[0]?.product),
+      productGroup2: firstDefined(...nsL.map((x) => x.productGroup2)),
       status: firstDefined(nsL[0]?.status, cbL[0]?.status, s5L[0]?.status),
       sch5Status: firstDefined(s5L[0]?.status),
       flags, matchState,
@@ -389,7 +407,7 @@ const STYLES = `
 .recon { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   color:#1b1636; background:#f5f5fa; min-height:100%; padding:22px; line-height:1.45; }
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
-.num { font-variant-numeric: tabular-nums; text-align:right; white-space:nowrap; }
+.num { font-variant-numeric: tabular-nums; text-align:center; white-space:nowrap; }
 .wrap { max-width:1180px; margin:0 auto; }
 .head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:2px; }
 .head h1 { font-size:22px; margin:0; letter-spacing:-.02em; }
@@ -423,7 +441,7 @@ label.file.reload { background:#efeaff; color:#5514b4; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
 th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:#8a8aa3;
   border-bottom:1px solid #eceaf4; padding:8px 10px; position:sticky; top:0; background:#fff; }
-th.num { text-align:right; }
+th.num { text-align:center; }
 td { padding:9px 10px; border-bottom:1px solid #f1f0f8; vertical-align:top; }
 tr.click { cursor:pointer; }
 tr.click:hover { background:#faf9ff; }
@@ -698,7 +716,6 @@ export default function ReconciliationTool() {
 
   const TABS = [
     ["cross", "Cross-Reference"],
-    ["dashboard", "Dashboard"],
     ["btpay", "BT Payment Check"],
     ["exceptions", "Exceptions & Risk"],
     ["obi", "OBI Checks"],
@@ -796,28 +813,6 @@ export default function ReconciliationTool() {
         {tab !== "rawdata" && (anyLoaded || tab === "users") && (
           <>
             {tab === "cross" && <CrossReference records={result.records} />}
-
-            {/* DASHBOARD */}
-            {tab === "dashboard" && (
-              <>
-                <div className="kpis">
-                  <div className="kpi"><div className="lab">Expected (NetSuite GP)</div><div className="val mono">{gbp(totals.expected)}</div><div className="foot">across {result.counts.ns} lines</div></div>
-                  <div className="kpi"><div className="lab">Paid (Cobra)</div><div className="val mono">{gbp(totals.paid)}</div><div className="foot">across {result.counts.cb} lines</div></div>
-                  <div className="kpi"><div className="lab">Variance</div><div className={"val mono " + (Math.abs(totals.variance) < 1 ? "" : totals.variance < 0 ? "neg" : "pos")}>{gbp(totals.variance)}</div><div className="foot">paid − expected</div></div>
-                  <div className="kpi"><div className="lab">Flags to review</div><div className="val" style={{ color: totals.risk ? "#b3261e" : "#14804a" }}>{totals.exceptions}</div><div className="foot">{totals.risk} high-risk</div></div>
-                </div>
-
-                <div className="panel" style={{ marginTop: 16 }}>
-                  <h2>Forecast — expected commission not yet paid</h2>
-                  <ForecastPanel forecast={result.forecast} hasSch5={!!files.sch5} />
-                </div>
-
-                <div className="panel">
-                  <h2>Commission by agent (NetSuite)</h2>
-                  <BreakdownTable records={result.records} />
-                </div>
-              </>
-            )}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -1222,35 +1217,93 @@ function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta,
 
 // ---------- Cross-Reference tab: order ref across all three sheets ----------
 function CrossReference({ records }) {
-  const [onlyMissing, setOnlyMissing] = useState(false);
+  const [group2, setGroup2] = useState("all");
+  const [sheets, setSheets] = useState("all");
+  const [sort, setSort] = useState({ col: "diff", dir: "desc" });
+
   const spread = (vals) => { const v = vals.filter((x) => x != null); if (!v.length) return 0; return Math.max(...v) - Math.min(...v); };
 
-  const T = {
-    nsSov: sum(records.map((r) => r.nsSov)),
-    nsGp: sum(records.map((r) => r.expected)),
-    s5Sov: sum(records.map((r) => r.s5Sov)),
-    cbSov: sum(records.map((r) => r.cobraSov)),
-    cbGp: sum(records.map((r) => r.paid)),
+  const enriched = records.map((r) => ({
+    ...r,
+    sovSpread: spread([r.inNS ? r.nsSov : null, r.inSch5 ? r.s5Sov : null, r.inCobra ? r.cobraSov : null]),
+    gpDiff: (r.inNS ? r.expected : 0) - (r.inCobra ? r.paid : 0),
+    sheetCode: `${r.inNS ? "N" : "-"}${r.inCobra ? "C" : "-"}${r.inSch5 ? "S" : "-"}`,
+    onAll: r.inNS && r.inCobra && r.inSch5,
+  }));
+
+  const groups = [...new Set(enriched.map((r) => r.productGroup2).filter(Boolean))].sort();
+
+  const bySheets = (r) => {
+    if (sheets === "all") return true;
+    if (sheets === "all3") return r.onAll;
+    if (sheets === "missing") return !r.onAll;
+    if (sheets === "nsOnly") return r.inNS && !r.inCobra && !r.inSch5;
+    if (sheets === "cbOnly") return r.inCobra && !r.inNS && !r.inSch5;
+    if (sheets === "s5Only") return r.inSch5 && !r.inNS && !r.inCobra;
+    if (sheets === "noNS") return !r.inNS;
+    if (sheets === "noCobra") return !r.inCobra;
+    if (sheets === "noSch5") return !r.inSch5;
+    return true;
   };
 
-  const rows = records
-    .map((r) => ({
-      ...r,
-      sovSpread: spread([r.inNS ? r.nsSov : null, r.inSch5 ? r.s5Sov : null, r.inCobra ? r.cobraSov : null]),
-      gpDiff: (r.inNS ? r.expected : 0) - (r.inCobra ? r.paid : 0),
-      onAll: r.inNS && r.inCobra && r.inSch5,
-    }))
-    .filter((r) => !onlyMissing || !r.onAll)
-    .sort((a, b) => (Math.abs(b.sovSpread) + Math.abs(b.gpDiff)) - (Math.abs(a.sovSpread) + Math.abs(a.gpDiff)));
+  const filtered = enriched.filter(
+    (r) => (group2 === "all" || (r.productGroup2 || "(blank)") === group2) && bySheets(r)
+  );
+
+  const getVal = (r, col) => {
+    switch (col) {
+      case "order": return r.orderNum || "";
+      case "company": return (r.company || "").toLowerCase();
+      case "item": return (r.product || "").toLowerCase();
+      case "group2": return (r.productGroup2 || "").toLowerCase();
+      case "sheets": return r.sheetCode;
+      case "nsSov": return r.inNS ? r.nsSov : null;
+      case "s5Sov": return r.inSch5 ? r.s5Sov : null;
+      case "cbSov": return r.inCobra ? r.cobraSov : null;
+      case "sovSpread": return r.sovSpread;
+      case "nsGp": return r.inNS ? r.expected : null;
+      case "cbGp": return r.inCobra ? r.paid : null;
+      case "gpDiff": return r.gpDiff;
+      default: return Math.abs(r.sovSpread) + Math.abs(r.gpDiff);
+    }
+  };
+
+  const rows = [...filtered].sort((a, b) => {
+    const av = getVal(a, sort.col), bv = getVal(b, sort.col);
+    const an = av == null, bn = bv == null;
+    if (an && bn) return 0;
+    if (an) return 1;
+    if (bn) return -1;
+    let c;
+    if (typeof av === "number" && typeof bv === "number") c = av - bv;
+    else c = String(av).localeCompare(String(bv));
+    return sort.dir === "asc" ? c : -c;
+  });
+
+  const T = {
+    nsSov: sum(filtered.map((r) => r.nsSov)),
+    nsGp: sum(filtered.map((r) => r.expected)),
+    s5Sov: sum(filtered.map((r) => r.s5Sov)),
+    cbSov: sum(filtered.map((r) => r.cobraSov)),
+    cbGp: sum(filtered.map((r) => r.paid)),
+  };
 
   const shown = rows.slice(0, 1000);
   const cell = (v) => <span className="num mono">{gbp(v)}</span>;
   const diffCell = (v) => <span className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>{gbp(v)}</span>;
 
+  const click = (col) =>
+    setSort((s) => ({ col, dir: s.col === col ? (s.dir === "asc" ? "desc" : "asc") : (["order", "company", "item", "group2", "sheets"].includes(col) ? "asc" : "desc") }));
+  const H = ({ col, label, num }) => (
+    <th className={num ? "num" : ""} style={{ cursor: "pointer", userSelect: "none" }} onClick={() => click(col)}>
+      {label}{sort.col === col ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+    </th>
+  );
+
   return (
     <>
       <div className="panel">
-        <h2>Totals — SOV & GP across the three sheets</h2>
+        <h2>Totals — SOV &amp; GP across the three sheets</h2>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead>
@@ -1279,34 +1332,65 @@ function CrossReference({ records }) {
             </tbody>
           </table>
         </div>
+        <p className="note">Totals follow the filters below.</p>
       </div>
 
       <div className="panel">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-          <h2 style={{ margin: 0 }}>By order reference</h2>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
-            <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)} />
-            Only show refs missing from a sheet
-          </label>
+        <h2 style={{ marginBottom: 10 }}>By order reference</h2>
+        <div className="settings" style={{ marginBottom: 12 }}>
+          <span>Product Group 2:</span>
+          <select value={group2} onChange={(e) => setGroup2(e.target.value)}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            <option value="all">All groups</option>
+            {groups.map((g) => <option key={g} value={g}>{g}</option>)}
+            <option value="(blank)">(blank)</option>
+          </select>
+          <span style={{ width: 14 }} />
+          <span>Appears on:</span>
+          <select value={sheets} onChange={(e) => setSheets(e.target.value)}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            <option value="all">Any sheet</option>
+            <option value="all3">All three sheets</option>
+            <option value="missing">Missing from at least one</option>
+            <option value="noNS">Not on NetSuite</option>
+            <option value="noCobra">Not on Cobra</option>
+            <option value="noSch5">Not on Sch5</option>
+            <option value="nsOnly">NetSuite only</option>
+            <option value="cbOnly">Cobra only</option>
+            <option value="s5Only">Sch5 only</option>
+          </select>
+          <span style={{ color: "#8a8aa3" }}>{filtered.length} of {enriched.length} references</span>
         </div>
-        <p className="note" style={{ marginTop: 4 }}>
+        <p className="note" style={{ marginTop: 0 }}>
           Joined on order reference — <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
-          N / C / S shows which sheets each reference appears on. Biggest differences first.
+          Click any column heading to sort.
         </p>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead>
               <tr>
-                <th>Order ref</th><th>Sheets</th>
-                <th className="num">NS SOV</th><th className="num">Sch5 SOV</th><th className="num">Cobra SOV</th><th className="num">SOV Δ</th>
-                <th className="num">NS GP</th><th className="num">Cobra GP</th><th className="num">GP Δ</th>
+                <H col="order" label="Order ref" />
+                <H col="company" label="Company" />
+                <H col="item" label="Item name" />
+                <H col="group2" label="Product Group 2" />
+                <H col="sheets" label="Sheets" num />
+                <H col="nsSov" label="NS SOV" num />
+                <H col="s5Sov" label="Sch5 SOV" num />
+                <H col="cbSov" label="Cobra SOV" num />
+                <H col="sovSpread" label="SOV Δ" num />
+                <H col="nsGp" label="NS GP" num />
+                <H col="cbGp" label="Cobra GP" num />
+                <H col="gpDiff" label="GP Δ" num />
               </tr>
             </thead>
             <tbody>
               {shown.map((r) => (
                 <tr key={r.key}>
                   <td className="mono">{r.orderNum}</td>
-                  <td><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
+                  <td>{r.company}</td>
+                  <td>{r.product || "—"}</td>
+                  <td>{r.productGroup2 || "—"}</td>
+                  <td className="num"><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
                   <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">—</span>}</td>
                   <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">—</span>}</td>
                   <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">—</span>}</td>
@@ -1319,8 +1403,8 @@ function CrossReference({ records }) {
             </tbody>
           </table>
         </div>
-        {rows.length > 1000 && <p className="note">Showing the top 1,000 of {rows.length} references (by size of difference). Use the month filter to narrow.</p>}
-        {rows.length === 0 && <div className="empty">Nothing to show for this filter.</div>}
+        {rows.length > 1000 && <p className="note">Showing 1,000 of {rows.length} references. Narrow with the filters or the month selector.</p>}
+        {rows.length === 0 && <div className="empty">Nothing matches these filters.</div>}
       </div>
     </>
   );
