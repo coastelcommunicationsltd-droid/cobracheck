@@ -259,6 +259,7 @@ function reconcile(files, tol, period = "all") {
     const paid = sum(cbL.map((r) => r.paid)); // Cobra Commission Paid
     const nsSov = sum(nsL.map((r) => r.sov));
     const s5Sov = sum(s5L.map((r) => r.sov));
+    const cobraSov = sum(cbL.map((r) => r.sov));
 
     const sch5Cancelled =
       inSch5 &&
@@ -310,7 +311,7 @@ function reconcile(files, tol, period = "all") {
     records.push({
       key, orderNum: key, company, agent,
       inNS, inCobra, inSch5,
-      expected, recordedCobra, due, paid, nsSov, s5Sov,
+      expected, recordedCobra, due, paid, nsSov, s5Sov, cobraSov,
       payDelta, recordDelta, dueVsPaid, sovDelta,
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
       period: monthKey(nsL[0]?.date) || monthKey(cbL[0]?.date) || monthKey(s5L[0]?.date) || null,
@@ -481,7 +482,7 @@ export default function ReconciliationTool() {
   const [pass, setPass] = useState("");
   const [files, setFiles] = useState({ cobra: null, netsuite: null, sch5: null });
   const [errors, setErrors] = useState({});
-  const [tab, setTab] = useState("dashboard");
+  const [tab, setTab] = useState("cross");
   const [tol, setTol] = useState({ abs: 1, pct: 1 });
   const [expanded, setExpanded] = useState(new Set());
   const [session, setSession] = useState(null);
@@ -696,11 +697,13 @@ export default function ReconciliationTool() {
   }
 
   const TABS = [
+    ["cross", "Cross-Reference"],
     ["dashboard", "Dashboard"],
-    ["reconcile", "Reconciliation"],
     ["btpay", "BT Payment Check"],
     ["exceptions", "Exceptions & Risk"],
     ["obi", "OBI Checks"],
+    ["reconcile", "Reconciliation"],
+    ["rawdata", "Raw Data"],
     ...(isAdmin ? [["users", "Users"]] : []),
   ];
 
@@ -743,77 +746,27 @@ export default function ReconciliationTool() {
           </div>
         )}
 
-        {/* uploads */}
-        <div className="panel">
-          <h2>1 · Upload exports</h2>
-          <div className="uploads">
-            {[
-              ["cobra", "Cobra", "What BT actually paid"],
-              ["netsuite", "NetSuite", "What we expect & recorded"],
-              ["sch5", "Sch5", "BT source feed — status, cancels, SOV"],
-            ].map(([key, role, desc]) => {
-              const f = files[key];
-              const err = errors[key];
-              return (
-                <div key={key} className={"slot " + (f ? "loaded" : "")}>
-                  <div className="role">{role}</div>
-                  <div className="desc">{desc}</div>
-                  <label className={"file " + (f ? "reload" : "")}>
-                    {f ? "Replace file" : "Choose CSV"}
-                    <input type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" onChange={(e) => onFile(key, e.target.files[0])} />
-                  </label>
-                  {f && (
-                    <div className="status">
-                      ✓ {f.rows.length} rows · sheet "{f.sheet}"
-                      <br />
-                      <span style={{ color: "#8a8aa3" }}>{f.name}</span>
-                    </div>
-                  )}
-                  {err && <div className="status err">{err}</div>}
-                </div>
-              );
-            })}
-          </div>
-          <div className="settings" style={{ marginTop: 14 }}>
-            <span>Month to check:</span>
-            <select value={period} onChange={(e) => setPeriod(e.target.value)}
-              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
-              <option value="all">All months</option>
-              {result.periods.map((p) => (
-                <option key={p} value={p}>{periodLabel(p)}</option>
-              ))}
-            </select>
-            <span style={{ width: 18 }} />
-            <span>Match tolerance:</span>
-            <label>£<input type="number" value={tol.abs} min={0} step={0.5}
-              onChange={(e) => setTol((t) => ({ ...t, abs: Number(e.target.value) }))} /></label>
-            <label>or <input type="number" value={tol.pct} min={0} step={0.5}
-              onChange={(e) => setTol((t) => ({ ...t, pct: Number(e.target.value) }))} />%</label>
-            <span style={{ color: "#8a8aa3" }}>anything within this counts as a match.</span>
-          </div>
-          {supabase && session && anyLoaded && (
-            <div style={{ marginTop: 14, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-              <button
-                onClick={() => saveShared(files)}
-                disabled={saving}
-                style={{ background: saving ? "#b6a9e0" : "#5514b4", color: "#fff", border: "none",
-                  padding: "9px 16px", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: saving ? "default" : "pointer" }}>
-                {saving ? "Saving…" : "Save & share"}
-              </button>
-              <span className="sub" style={{ margin: 0 }}>
-                {saving
-                  ? "Storing the data — a few seconds."
-                  : sharedMeta?.at
-                    ? `Saved. Shared with everyone signed in (last: ${new Date(sharedMeta.at).toLocaleString("en-GB")}).`
-                    : "Load your files, then click Save & share once."}
-              </span>
-              {errors.save && <span className="sub" style={{ margin: 0, color: "#b3261e" }}>{errors.save}</span>}
+        {/* controls: month + tolerance (only once there's data) */}
+        {anyLoaded && (
+          <div className="panel">
+            <div className="settings">
+              <span>Month to check:</span>
+              <select value={period} onChange={(e) => setPeriod(e.target.value)}
+                style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+                <option value="all">All months</option>
+                {result.periods.map((p) => (
+                  <option key={p} value={p}>{periodLabel(p)}</option>
+                ))}
+              </select>
+              <span style={{ width: 18 }} />
+              <span>Match tolerance:</span>
+              <label>£<input type="number" value={tol.abs} min={0} step={0.5}
+                onChange={(e) => setTol((t) => ({ ...t, abs: Number(e.target.value) }))} /></label>
+              <label>or <input type="number" value={tol.pct} min={0} step={0.5}
+                onChange={(e) => setTol((t) => ({ ...t, pct: Number(e.target.value) }))} />%</label>
+              <span style={{ color: "#8a8aa3" }}>anything within this counts as a match.</span>
             </div>
-          )}
-        </div>
-
-        {!anyLoaded && (
-          <div className="empty panel">Upload at least NetSuite and Cobra to start reconciling.</div>
+          </div>
         )}
 
         {anyLoaded && allLoaded && result.counts.overlap === 0 && (
@@ -824,13 +777,25 @@ export default function ReconciliationTool() {
           </div>
         )}
 
-        {anyLoaded && (
+        {/* top bar */}
+        <div className="tabs">
+          {TABS.map(([k, l]) => (
+            <button key={k} className={"tab " + (tab === k ? "active" : "")} onClick={() => setTab(k)}>{l}</button>
+          ))}
+        </div>
+
+        {tab === "rawdata" && (
+          <RawData files={files} errors={errors} onFile={onFile} supabase={supabase}
+            session={session} saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} />
+        )}
+
+        {tab !== "rawdata" && tab !== "users" && !anyLoaded && (
+          <div className="empty panel">No data loaded yet. Open the <strong>Raw Data</strong> tab to upload the three exports.</div>
+        )}
+
+        {tab !== "rawdata" && (anyLoaded || tab === "users") && (
           <>
-            <div className="tabs">
-              {TABS.map(([k, l]) => (
-                <button key={k} className={"tab " + (tab === k ? "active" : "")} onClick={() => setTab(k)}>{l}</button>
-              ))}
-            </div>
+            {tab === "cross" && <CrossReference records={result.records} />}
 
             {/* DASHBOARD */}
             {tab === "dashboard" && (
@@ -1155,5 +1120,208 @@ function ObiChecks({ records }) {
         );
       })}
     </div>
+  );
+}
+
+// ---------- Raw Data tab: uploads + collapsible source previews ----------
+function fmtCell(v) {
+  if (v == null || v === "") return "";
+  if (v instanceof Date) return v.toLocaleDateString("en-GB");
+  const s = String(v);
+  return s.length > 60 ? s.slice(0, 60) + "…" : s;
+}
+
+function RawTable({ f }) {
+  const rows = f.rows || [];
+  const cols = f.headers && f.headers.length ? f.headers : (rows[0] ? Object.keys(rows[0]) : []);
+  const shown = rows.slice(0, 200);
+  if (!rows.length) return <p className="note" style={{ marginTop: 6 }}>No rows.</p>;
+  return (
+    <div style={{ overflowX: "auto", marginTop: 8 }}>
+      <table>
+        <thead><tr>{cols.map((c) => <th key={c}>{c}</th>)}</tr></thead>
+        <tbody>
+          {shown.map((r, i) => (
+            <tr key={i}>{cols.map((c) => <td key={c} className="mono" style={{ fontSize: 12 }}>{fmtCell(r[c])}</td>)}</tr>
+          ))}
+        </tbody>
+      </table>
+      {rows.length > 200 && <p className="note">Showing the first 200 of {rows.length} rows.</p>}
+    </div>
+  );
+}
+
+function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded }) {
+  const [open, setOpen] = useState({});
+  const sources = [
+    ["cobra", "Cobra", "What BT actually paid"],
+    ["netsuite", "NetSuite", "What we expect & recorded"],
+    ["sch5", "Sch5", "BT source feed — status, cancels, SOV"],
+  ];
+  return (
+    <>
+      <div className="panel">
+        <h2>Upload exports</h2>
+        <div className="uploads">
+          {sources.map(([key, role, desc]) => {
+            const f = files[key];
+            const err = errors[key];
+            return (
+              <div key={key} className={"slot " + (f ? "loaded" : "")}>
+                <div className="role">{role}</div>
+                <div className="desc">{desc}</div>
+                <label className={"file " + (f ? "reload" : "")}>
+                  {f ? "Replace file" : "Choose CSV"}
+                  <input type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" onChange={(e) => onFile(key, e.target.files[0])} />
+                </label>
+                {f && (
+                  <div className="status">✓ {f.rows.length} rows<br /><span style={{ color: "#8a8aa3" }}>{f.name}</span></div>
+                )}
+                {err && <div className="status err">{err}</div>}
+              </div>
+            );
+          })}
+        </div>
+        {supabase && session && anyLoaded && (
+          <div style={{ marginTop: 14, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+            <button onClick={() => saveShared(files)} disabled={saving}
+              style={{ background: saving ? "#b6a9e0" : "#5514b4", color: "#fff", border: "none", padding: "9px 16px", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: saving ? "default" : "pointer" }}>
+              {saving ? "Saving…" : "Save & share"}
+            </button>
+            <span className="sub" style={{ margin: 0 }}>
+              {saving ? "Storing the data — a few seconds."
+                : sharedMeta?.at ? `Saved. Shared with everyone signed in (last: ${new Date(sharedMeta.at).toLocaleString("en-GB")}).`
+                  : "Load your files, then click Save & share once."}
+            </span>
+            {errors.save && <span className="sub" style={{ margin: 0, color: "#b3261e" }}>{errors.save}</span>}
+          </div>
+        )}
+      </div>
+
+      <div className="panel">
+        <h2>What's held in here</h2>
+        <p className="note" style={{ marginTop: 0 }}>The data behind each source. Click a row to open it (collapsed by default).</p>
+        {sources.map(([key, label]) => {
+          const f = files[key];
+          const isOpen = !!open[key];
+          return (
+            <div key={key} style={{ borderTop: "1px solid #f1f0f8", padding: "10px 0" }}>
+              <div style={{ cursor: f ? "pointer" : "default", fontWeight: 600, display: "flex", gap: 8, color: f ? "#1b1636" : "#a7a3bf" }}
+                onClick={() => f && setOpen((o) => ({ ...o, [key]: !o[key] }))}>
+                <span style={{ color: "#5514b4" }}>{f ? (isOpen ? "▾" : "▸") : "•"}</span>
+                {label} {f ? <span className="sub" style={{ margin: 0 }}>— {f.rows.length} rows</span> : <span className="sub" style={{ margin: 0 }}>— not loaded</span>}
+              </div>
+              {isOpen && f && <RawTable f={f} />}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+// ---------- Cross-Reference tab: order ref across all three sheets ----------
+function CrossReference({ records }) {
+  const [onlyMissing, setOnlyMissing] = useState(false);
+  const spread = (vals) => { const v = vals.filter((x) => x != null); if (!v.length) return 0; return Math.max(...v) - Math.min(...v); };
+
+  const T = {
+    nsSov: sum(records.map((r) => r.nsSov)),
+    nsGp: sum(records.map((r) => r.expected)),
+    s5Sov: sum(records.map((r) => r.s5Sov)),
+    cbSov: sum(records.map((r) => r.cobraSov)),
+    cbGp: sum(records.map((r) => r.paid)),
+  };
+
+  const rows = records
+    .map((r) => ({
+      ...r,
+      sovSpread: spread([r.inNS ? r.nsSov : null, r.inSch5 ? r.s5Sov : null, r.inCobra ? r.cobraSov : null]),
+      gpDiff: (r.inNS ? r.expected : 0) - (r.inCobra ? r.paid : 0),
+      onAll: r.inNS && r.inCobra && r.inSch5,
+    }))
+    .filter((r) => !onlyMissing || !r.onAll)
+    .sort((a, b) => (Math.abs(b.sovSpread) + Math.abs(b.gpDiff)) - (Math.abs(a.sovSpread) + Math.abs(a.gpDiff)));
+
+  const shown = rows.slice(0, 1000);
+  const cell = (v) => <span className="num mono">{gbp(v)}</span>;
+  const diffCell = (v) => <span className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>{gbp(v)}</span>;
+
+  return (
+    <>
+      <div className="panel">
+        <h2>Totals — SOV & GP across the three sheets</h2>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Metric</th><th className="num">NetSuite</th><th className="num">Sch5</th><th className="num">Cobra</th>
+                <th className="num">NS − Cobra</th><th className="num">NS − Sch5</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><strong>SOV</strong> <span className="sub">(Contract Value / SOV)</span></td>
+                <td className="num mono">{gbp(T.nsSov)}</td>
+                <td className="num mono">{gbp(T.s5Sov)}</td>
+                <td className="num mono">{gbp(T.cbSov)}</td>
+                <td>{diffCell(T.nsSov - T.cbSov)}</td>
+                <td>{diffCell(T.nsSov - T.s5Sov)}</td>
+              </tr>
+              <tr>
+                <td><strong>GP</strong> <span className="sub">(Product GP / Commission Paid)</span></td>
+                <td className="num mono">{gbp(T.nsGp)}</td>
+                <td className="num mono">—</td>
+                <td className="num mono">{gbp(T.cbGp)}</td>
+                <td>{diffCell(T.nsGp - T.cbGp)}</td>
+                <td className="num mono">—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h2 style={{ margin: 0 }}>By order reference</h2>
+          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}>
+            <input type="checkbox" checked={onlyMissing} onChange={(e) => setOnlyMissing(e.target.checked)} />
+            Only show refs missing from a sheet
+          </label>
+        </div>
+        <p className="note" style={{ marginTop: 4 }}>
+          Joined on order reference — <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
+          N / C / S shows which sheets each reference appears on. Biggest differences first.
+        </p>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Order ref</th><th>Sheets</th>
+                <th className="num">NS SOV</th><th className="num">Sch5 SOV</th><th className="num">Cobra SOV</th><th className="num">SOV Δ</th>
+                <th className="num">NS GP</th><th className="num">Cobra GP</th><th className="num">GP Δ</th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((r) => (
+                <tr key={r.key}>
+                  <td className="mono">{r.orderNum}</td>
+                  <td><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
+                  <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">—</span>}</td>
+                  <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">—</span>}</td>
+                  <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">—</span>}</td>
+                  <td>{diffCell(r.sovSpread)}</td>
+                  <td>{r.inNS ? cell(r.expected) : <span className="num sub">—</span>}</td>
+                  <td>{r.inCobra ? cell(r.paid) : <span className="num sub">—</span>}</td>
+                  <td>{diffCell(r.gpDiff)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {rows.length > 1000 && <p className="note">Showing the top 1,000 of {rows.length} references (by size of difference). Use the month filter to narrow.</p>}
+        {rows.length === 0 && <div className="empty">Nothing to show for this filter.</div>}
+      </div>
+    </>
   );
 }
