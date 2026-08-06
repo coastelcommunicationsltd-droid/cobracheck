@@ -15,13 +15,20 @@ import { createClient } from "@supabase/supabase-js";
 // protection is the login + the email allow-list you set up in the SQL step.
 // The URL below is already your existing project; just paste the anon key.
 const SUPABASE_URL = "https://xrekebgnubhjqtpllbcz.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhyZWtlYmdudWJoanF0cGxsYmN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MDEyNDMsImV4cCI6MjEwMDk3NzI0M30.1MbG2AX63hFNvzZoZB56pjkOlW6Dq7s4U5mGaaJGi80";
+const SUPABASE_ANON_KEY = "PASTE-YOUR-ANON-KEY-HERE";
 // ==========================================================
 
 const supabase =
   SUPABASE_URL.startsWith("https://") && !SUPABASE_ANON_KEY.startsWith("PASTE")
     ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
+
+// a throwaway client for creating other people's logins WITHOUT signing the
+// admin out of their own session (signUp normally hijacks the current session)
+const makeSignupClient = () =>
+  createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false, storageKey: "recon-signup-temp" },
+  });
 
 // fallback passcode — ONLY used if Supabase isn't configured yet (local testing)
 const PASSCODE = "BTLBDCSDTEST";
@@ -42,6 +49,26 @@ const gbp = (n) =>
     ? "—"
     : new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(n);
 const firstDefined = (...xs) => xs.find((x) => x != null && x !== "") ?? null;
+
+// derive a YYYY-MM key from many date shapes (Date, ISO string, UK D/M/Y, YYYYMM)
+const monthKey = (v) => {
+  if (v == null || v === "") return null;
+  if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}`;
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{2})/); // ISO
+  if (m) return `${m[1]}-${m[2]}`;
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/); // UK day/month/year
+  if (m) { const y = m[3].length === 2 ? "20" + m[3] : m[3]; return `${y}-${String(Number(m[2])).padStart(2, "0")}`; }
+  m = s.match(/^(\d{4})(\d{2})$/); // YYYYMM (e.g. 202601)
+  if (m) return `${m[1]}-${m[2]}`;
+  return null;
+};
+const periodLabel = (key) => {
+  if (!key) return "No date";
+  const [y, mo] = key.split("-");
+  const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${names[Number(mo) - 1] || mo} ${y}`;
+};
 
 // resolve a value from a raw row by trying candidate header names (exact, then fuzzy)
 const pick = (row, candidates) => {
@@ -117,6 +144,7 @@ const nsRow = (r) => ({
   accelerator: firstDefined(pick(r, ["Accelerator?", "Accelerator"])),
   agent: firstDefined(pick(r, ["Admin Agent"])),
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
+  date: pick(r, ["Netsuite Date"]),
   raw: r,
 });
 
@@ -133,6 +161,7 @@ const cobraRow = (r) => ({
   paid: money(pick(r, ["Commission Paid"])), // what BT actually paid
   product: firstDefined(pick(r, ["Measure", "Plan Name"])),
   prodCode: firstDefined(pick(r, ["Prod Code"])),
+  date: pick(r, ["Closed Date", "Order Date"]),
   raw: r,
 });
 
@@ -150,6 +179,7 @@ const sch5Row = (r) => ({
   product: firstDefined(pick(r, ["PRODUCT SUB NAME1"])),
   transactional: firstDefined(pick(r, ["TRANSACTIONAL"])),
   recentCancel: firstDefined(pick(r, ["RECENT CANCELLATION"])),
+  date: pick(r, ["CLOSED DATE", "ORDER DATE", "REPORTING MONTH"]),
   raw: r,
 });
 
@@ -164,7 +194,7 @@ const groupBy = (rows, keyFn) => {
 };
 
 // ---------- the reconciliation engine ----------
-function reconcile(files, tol) {
+function reconcile(files, tol, period = "all") {
   const ns = (files.netsuite?.rows || []).map(nsRow);
   const cb = (files.cobra?.rows || []).map(cobraRow);
   const s5 = (files.sch5?.rows || []).map(sch5Row);
@@ -249,6 +279,7 @@ function reconcile(files, tol) {
       expected, recordedCobra, due, paid, nsSov, s5Sov,
       payDelta, recordDelta, dueVsPaid, sovDelta,
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
+      period: monthKey(nsL[0]?.date) || monthKey(cbL[0]?.date) || monthKey(s5L[0]?.date) || null,
       status: firstDefined(nsL[0]?.status, cbL[0]?.status, s5L[0]?.status),
       sch5Status: firstDefined(s5L[0]?.status),
       flags, matchState,
@@ -264,7 +295,7 @@ function reconcile(files, tol) {
 
   // ---- forecast: NetSuite lines not yet paid ----
   const unpaidLines = ns.filter((r) => r.itemPaid != null && !isYes(r.itemPaid) && (r.expected || 0) > 0);
-  const forecast = unpaidLines.map((r) => {
+  const forecastAll = unpaidLines.map((r) => {
     const s5L = s5By.get(r.orderNum) || [];
     const cancelled = s5L.some(
       (x) => (x.status && /cancel/i.test(String(x.status))) || x.cancelDate != null
@@ -275,18 +306,29 @@ function reconcile(files, tol) {
     if (cancelled) verdict = "at_risk_cancelled";
     else if (nonComm) verdict = "at_risk_noncomm";
     else if (!inS5) verdict = "unverified";
-    return { ...r, verdict };
+    return { ...r, verdict, period: monthKey(r.date) || null };
   });
 
-  const overlap = [...keys].filter((k) => {
+  // full list of months present, for the dropdown (built before filtering)
+  const periods = [...new Set(records.map((r) => r.period).filter(Boolean))].sort().reverse();
+
+  // apply the selected-month filter
+  const inPeriod = (p) => period === "all" || p === period;
+  const recordsF = records.filter((r) => inPeriod(r.period));
+  const forecast = forecastAll.filter((r) => inPeriod(r.period));
+
+  const overlap = recordsF.filter((r) => {
     let c = 0;
-    if (nsBy.has(k)) c++;
-    if (cbBy.has(k)) c++;
-    if (s5By.has(k)) c++;
+    if (r.inNS) c++;
+    if (r.inCobra) c++;
+    if (r.inSch5) c++;
     return c >= 2;
   }).length;
 
-  return { records, forecast, keys: [...keys], counts: { ns: ns.length, cb: cb.length, s5: s5.length, overlap } };
+  return {
+    records: recordsF, forecast, periods,
+    counts: { ns: ns.length, cb: cb.length, s5: s5.length, overlap },
+  };
 }
 
 // ---------- CSV export ----------
@@ -411,9 +453,15 @@ export default function ReconciliationTool() {
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [authMsg, setAuthMsg] = useState(null);
   const [sharedMeta, setSharedMeta] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [period, setPeriod] = useState("all");
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [newUser, setNewUser] = useState({ email: "", password: "" });
+  const [userMsg, setUserMsg] = useState(null);
 
   // track the logged-in session
   useEffect(() => {
@@ -442,7 +490,44 @@ export default function ReconciliationTool() {
     return () => { cancelled = true; };
   }, [session]);
 
-  // save the current set of files to the shared store
+  // work out if the signed-in user is an admin, and load the user list
+  const loadUsers = useCallback(async () => {
+    if (!supabase || !session) return;
+    const { data } = await supabase.from("recon_allowlist").select("email, is_admin").order("email");
+    if (data) {
+      setUsers(data);
+      const me = (session.user?.email || "").toLowerCase();
+      setIsAdmin(data.some((u) => (u.email || "").toLowerCase() === me && u.is_admin));
+    }
+  }, [session]);
+
+  useEffect(() => { loadUsers(); }, [loadUsers]);
+
+  // admin: create a login (email + password) and add them to the allow-list
+  const addUser = useCallback(async () => {
+    setUserMsg(null);
+    const em = newUser.email.trim().toLowerCase();
+    const pw = newUser.password;
+    if (!em || pw.length < 6) { setUserMsg({ err: true, text: "Enter an email and a password of at least 6 characters." }); return; }
+    // create the auth account on a throwaway client so it doesn't sign you out
+    const tmp = makeSignupClient();
+    const { error: sErr } = await tmp.auth.signUp({ email: em, password: pw });
+    if (sErr && !/already registered/i.test(sErr.message)) {
+      setUserMsg({ err: true, text: sErr.message }); return;
+    }
+    // add to the allow-list so they can actually see the data
+    const { error: aErr } = await supabase.from("recon_allowlist").upsert({ email: em }, { onConflict: "email" });
+    if (aErr) { setUserMsg({ err: true, text: "Account made, but couldn't add to the allow-list: " + aErr.message }); return; }
+    setNewUser({ email: "", password: "" });
+    setUserMsg({ err: false, text: `${em} can now sign in with that password.` });
+    loadUsers();
+  }, [newUser, loadUsers]);
+
+  const removeUser = useCallback(async (em) => {
+    if ((em || "").toLowerCase() === (session?.user?.email || "").toLowerCase()) return; // don't remove yourself
+    await supabase.from("recon_allowlist").delete().eq("email", em);
+    loadUsers();
+  }, [session, loadUsers]);
   const saveShared = useCallback(async (nextFiles) => {
     if (!supabase || !session) return;
     setSaving(true);
@@ -474,7 +559,7 @@ export default function ReconciliationTool() {
     }
   }, [saveShared]);
 
-  const result = useMemo(() => reconcile(files, tol), [files, tol]);
+  const result = useMemo(() => reconcile(files, tol, period), [files, tol, period]);
   const anyLoaded = files.cobra || files.netsuite || files.sch5;
   const allLoaded = files.cobra && files.netsuite && files.sch5;
 
@@ -508,17 +593,13 @@ export default function ReconciliationTool() {
       );
     }
     if (!session) {
-      const sendLink = async () => {
+      const signIn = async () => {
         setAuthMsg(null);
-        const { error } = await supabase.auth.signInWithOtp({
+        const { error } = await supabase.auth.signInWithPassword({
           email: email.trim(),
-          options: { emailRedirectTo: window.location.origin },
+          password,
         });
-        setAuthMsg(
-          error
-            ? { err: true, text: error.message }
-            : { err: false, text: "Sign-in link sent — check your email (and spam)." }
-        );
+        if (error) setAuthMsg({ err: true, text: "Email or password not recognised." });
       };
       return (
         <div className="recon"><style>{STYLES}</style>
@@ -527,16 +608,22 @@ export default function ReconciliationTool() {
               Commission <span style={{ color: "#5514b4" }}>Reconciliation</span>
             </h1>
             <p className="sub" style={{ margin: "6px 0 0" }}>
-              Sign in to view the shared reconciliation. Access is limited to approved emails.
+              Sign in to view the shared reconciliation.
             </p>
             <input
               type="email"
               value={email}
-              placeholder="you@company.com"
+              placeholder="Email"
               onChange={(e) => setEmail(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && email.trim() && sendLink()}
             />
-            <button onClick={() => email.trim() && sendLink()}>Email me a sign-in link</button>
+            <input
+              type="password"
+              value={password}
+              placeholder="Password"
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && email.trim() && password && signIn()}
+            />
+            <button onClick={() => email.trim() && password && signIn()}>Sign in</button>
             {authMsg && (
               <p className="sub" style={{ color: authMsg.err ? "#b3261e" : "#14804a", marginTop: 10 }}>{authMsg.text}</p>
             )}
@@ -577,6 +664,7 @@ export default function ReconciliationTool() {
     ["btpay", "BT Payment Check"],
     ["exceptions", "Exceptions & Risk"],
     ["obi", "OBI Checks"],
+    ...(isAdmin ? [["users", "Users"]] : []),
   ];
 
   return (
@@ -633,6 +721,15 @@ export default function ReconciliationTool() {
             })}
           </div>
           <div className="settings" style={{ marginTop: 14 }}>
+            <span>Month to check:</span>
+            <select value={period} onChange={(e) => setPeriod(e.target.value)}
+              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+              <option value="all">All months</option>
+              {result.periods.map((p) => (
+                <option key={p} value={p}>{periodLabel(p)}</option>
+              ))}
+            </select>
+            <span style={{ width: 18 }} />
             <span>Match tolerance:</span>
             <label>£<input type="number" value={tol.abs} min={0} step={0.5}
               onChange={(e) => setTol((t) => ({ ...t, abs: Number(e.target.value) }))} /></label>
@@ -812,11 +909,49 @@ export default function ReconciliationTool() {
                 )}
               </div>
             )}
+            {tab === "users" && isAdmin && (
+              <div className="panel">
+                <h2>Users — who can sign in</h2>
+                <div className="banner info">
+                  Add a person's email and a password here, then hand them those two things — that's how they sign in.
+                  Only people in this list can see the data.
+                </div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+                  <input type="email" placeholder="Email" value={newUser.email}
+                    onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
+                    style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 220 }} />
+                  <input type="text" placeholder="Password (min 6 chars)" value={newUser.password}
+                    onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
+                    style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 200 }} />
+                  <button className="btn" style={{ background: "#5514b4", color: "#fff" }} onClick={addUser}>Add login</button>
+                </div>
+                {userMsg && (
+                  <p className="sub" style={{ color: userMsg.err ? "#b3261e" : "#14804a", marginTop: 0 }}>{userMsg.text}</p>
+                )}
+                <table>
+                  <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
+                  <tbody>
+                    {users.map((u) => (
+                      <tr key={u.email}>
+                        <td className="mono">{u.email}</td>
+                        <td>{u.is_admin ? <span className="chip matched">admin</span> : <span className="chip unmatched">viewer</span>}</td>
+                        <td className="num">
+                          {(u.email || "").toLowerCase() !== (session?.user?.email || "").toLowerCase() && (
+                            <button className="btn" onClick={() => removeUser(u.email)}>Remove</button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <p className="note">Removing someone stops them seeing the data. Their password reset (if ever needed) is done from Supabase.</p>
+              </div>
+            )}
           </>
         )}
 
         <p className="note" style={{ textAlign: "center", marginTop: 20 }}>
-          Access is a shared code for testing only — real per-user control comes when this folds into the main system.
+          Access is limited to the emails in the Users list. Real commission data is stored in Supabase, protected by that list.
         </p>
       </div>
     </div>
