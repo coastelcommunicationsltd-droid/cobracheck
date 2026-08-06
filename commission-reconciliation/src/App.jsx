@@ -135,6 +135,33 @@ async function parseWorkbook(file) {
   return { sheet: best, headers, rows, sheetNames: wb.SheetNames };
 }
 
+// ---------- only these columns are kept when saving to the shared store ----------
+// (everything the reconciliation actually uses; the rest — e.g. Sch5's ~69 cols — is dropped
+//  so the saved dataset stays small enough to store quickly)
+const KEEP_COLS = {
+  netsuite: ["Opp ID", "Order ref", "Company Name", "Order Status", "Contract Value",
+    "Item: Name (Grouped)", "Item Name", "Product GP", "Cobra Payment", "Item Paid",
+    "Overpayment", "Accelerator?", "Admin Agent", "Customer Le", "Netsuite Date"],
+  cobra: ["Job Header", "Opty ID", "LE Code", "Customer Name", "Status", "Month",
+    "Contract Value", "Commission Due", "Commission Paid", "Measure", "Plan Name",
+    "Prod Code", "Closed Date", "Order Date"],
+  sch5: ["MAIN ORDER NUM", "ADT REF", "OPPORTUNITY ID", "LE CODE", "CUSTOMER NAME",
+    "ORDER STATUS", "ORDER SUB STATUS", "CANCEL DATE", "SOV", "COMMISSION FLAG",
+    "PRODUCT SUB NAME1", "TRANSACTIONAL", "RECENT CANCELLATION", "CLOSED DATE",
+    "ORDER DATE", "REPORTING MONTH"],
+};
+const normHead = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+const slimFileForSave = (f, which) => {
+  if (!f) return null;
+  const keep = new Set((KEEP_COLS[which] || []).map(normHead));
+  const rows = (f.rows || []).map((row) => {
+    const out = {};
+    for (const k of Object.keys(row)) if (keep.has(normHead(k))) out[k] = row[k];
+    return out;
+  });
+  return { sheet: f.sheet, name: f.name, rows };
+};
+
 // ---------- canonical row extractors ----------
 const nsRow = (r) => ({
   src: "netsuite",
@@ -538,17 +565,18 @@ export default function ReconciliationTool() {
   const saveShared = useCallback(async (nextFiles) => {
     if (!supabase || !session) return;
     setSaving(true);
+    setErrors((e) => ({ ...e, save: null }));
     const payload = {
       id: "current",
-      cobra: nextFiles.cobra || null,
-      netsuite: nextFiles.netsuite || null,
-      sch5: nextFiles.sch5 || null,
+      cobra: slimFileForSave(nextFiles.cobra, "cobra"),
+      netsuite: slimFileForSave(nextFiles.netsuite, "netsuite"),
+      sch5: slimFileForSave(nextFiles.sch5, "sch5"),
       uploaded_by: session.user?.email || null,
       uploaded_at: new Date().toISOString(),
     };
     const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
     setSaving(false);
-    if (error) setErrors((e) => ({ ...e, save: "Couldn't save to the shared store — are you on the allow-list?" }));
+    if (error) setErrors((e) => ({ ...e, save: "Couldn't save: " + error.message }));
     else { setSharedMeta({ by: payload.uploaded_by, at: payload.uploaded_at }); setErrors((e) => ({ ...e, save: null })); }
   }, [session]);
 
@@ -557,10 +585,8 @@ export default function ReconciliationTool() {
     try {
       const parsed = await parseWorkbook(file);
       const entry = { sheet: parsed.sheet, headers: parsed.headers, rows: parsed.rows, name: file.name };
-      let nextFiles;
-      setFiles((f) => (nextFiles = { ...f, [which]: entry }));
+      setFiles((f) => ({ ...f, [which]: entry }));
       setErrors((e) => ({ ...e, [which]: null }));
-      saveShared(nextFiles);
     } catch (err) {
       setErrors((e) => ({ ...e, [which]: "Couldn't read that file — is it a valid CSV or Excel file?" }));
     }
@@ -765,6 +791,25 @@ export default function ReconciliationTool() {
               onChange={(e) => setTol((t) => ({ ...t, pct: Number(e.target.value) }))} />%</label>
             <span style={{ color: "#8a8aa3" }}>anything within this counts as a match.</span>
           </div>
+          {supabase && session && anyLoaded && (
+            <div style={{ marginTop: 14, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                onClick={() => saveShared(files)}
+                disabled={saving}
+                style={{ background: saving ? "#b6a9e0" : "#5514b4", color: "#fff", border: "none",
+                  padding: "9px 16px", borderRadius: 8, fontWeight: 700, fontSize: 13, cursor: saving ? "default" : "pointer" }}>
+                {saving ? "Saving…" : "Save & share"}
+              </button>
+              <span className="sub" style={{ margin: 0 }}>
+                {saving
+                  ? "Storing the data — a few seconds."
+                  : sharedMeta?.at
+                    ? `Saved. Shared with everyone signed in (last: ${new Date(sharedMeta.at).toLocaleString("en-GB")}).`
+                    : "Load your files, then click Save & share once."}
+              </span>
+              {errors.save && <span className="sub" style={{ margin: 0, color: "#b3261e" }}>{errors.save}</span>}
+            </div>
+          )}
         </div>
 
         {!anyLoaded && (
