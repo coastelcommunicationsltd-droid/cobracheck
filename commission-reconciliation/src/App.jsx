@@ -1,15 +1,29 @@
-import { useState, useMemo, useCallback, Fragment } from "react";
+import { useState, useMemo, useCallback, useEffect, Fragment } from "react";
 import * as XLSX from "xlsx";
+import { createClient } from "@supabase/supabase-js";
 
 /* =========================================================================
-   Commission Reconciliation — standalone test tool
-   Manual uploads: Cobra (what BT paid) · NetSuite (what we expect/recorded) · Sch5 (BT source feed)
+   Commission Reconciliation — shared, login-gated version
+   Sources: Cobra (what BT paid) · NetSuite (what we expect/recorded) · Sch5 (BT source feed)
    Join key: BT order number  (Cobra "Job Header" = NetSuite "Order ref" = Sch5 "MAIN ORDER NUM")
-   All processing happens in the browser. Nothing is uploaded anywhere.
+   Data is uploaded once and saved to Supabase, so everyone signed in sees the same view.
    ========================================================================= */
 
-// ---- passcode (client-side gate only — NOT real security; real access control
-//      comes when this folds into the main auth'd system) ----
+// ============ PASTE YOUR SUPABASE DETAILS HERE ============
+// Both come from Supabase → Project Settings → API.
+// The anon key is SAFE to be public (Supabase designed it that way) — the real
+// protection is the login + the email allow-list you set up in the SQL step.
+// The URL below is already your existing project; just paste the anon key.
+const SUPABASE_URL = "https://xrekebgnubhjqtpllbcz.supabase.co";
+const SUPABASE_ANON_KEY = "PASTE-YOUR-ANON-KEY-HERE";
+// ==========================================================
+
+const supabase =
+  SUPABASE_URL.startsWith("https://") && !SUPABASE_ANON_KEY.startsWith("PASTE")
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+    : null;
+
+// fallback passcode — ONLY used if Supabase isn't configured yet (local testing)
 const PASSCODE = "BTLBDCSDTEST";
 
 // ---------- helpers ----------
@@ -394,17 +408,71 @@ export default function ReconciliationTool() {
   const [tab, setTab] = useState("dashboard");
   const [tol, setTol] = useState({ abs: 1, pct: 1 });
   const [expanded, setExpanded] = useState(new Set());
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [email, setEmail] = useState("");
+  const [authMsg, setAuthMsg] = useState(null);
+  const [sharedMeta, setSharedMeta] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  // track the logged-in session
+  useEffect(() => {
+    if (!supabase) { setAuthReady(true); return; }
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setAuthReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  // once signed in, load the shared dataset so everyone sees the same thing
+  useEffect(() => {
+    if (!supabase || !session) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("recon_datasets").select("*").eq("id", "current").maybeSingle();
+      if (cancelled || error || !data) return;
+      const next = {};
+      for (const k of ["cobra", "netsuite", "sch5"]) if (data[k]) next[k] = data[k];
+      if (Object.keys(next).length) setFiles((f) => ({ ...f, ...next }));
+      setSharedMeta({ by: data.uploaded_by, at: data.uploaded_at });
+    })();
+    return () => { cancelled = true; };
+  }, [session]);
+
+  // save the current set of files to the shared store
+  const saveShared = useCallback(async (nextFiles) => {
+    if (!supabase || !session) return;
+    setSaving(true);
+    const payload = {
+      id: "current",
+      cobra: nextFiles.cobra || null,
+      netsuite: nextFiles.netsuite || null,
+      sch5: nextFiles.sch5 || null,
+      uploaded_by: session.user?.email || null,
+      uploaded_at: new Date().toISOString(),
+    };
+    const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
+    setSaving(false);
+    if (error) setErrors((e) => ({ ...e, save: "Couldn't save to the shared store — are you on the allow-list?" }));
+    else { setSharedMeta({ by: payload.uploaded_by, at: payload.uploaded_at }); setErrors((e) => ({ ...e, save: null })); }
+  }, [session]);
 
   const onFile = useCallback(async (which, file) => {
     if (!file) return;
     try {
       const parsed = await parseWorkbook(file);
-      setFiles((f) => ({ ...f, [which]: { ...parsed, name: file.name } }));
+      const entry = { sheet: parsed.sheet, headers: parsed.headers, rows: parsed.rows, name: file.name };
+      let nextFiles;
+      setFiles((f) => (nextFiles = { ...f, [which]: entry }));
       setErrors((e) => ({ ...e, [which]: null }));
+      saveShared(nextFiles);
     } catch (err) {
       setErrors((e) => ({ ...e, [which]: "Couldn't read that file — is it a valid .xlsx?" }));
     }
-  }, []);
+  }, [saveShared]);
 
   const result = useMemo(() => reconcile(files, tol), [files, tol]);
   const anyLoaded = files.cobra || files.netsuite || files.sch5;
@@ -430,7 +498,55 @@ export default function ReconciliationTool() {
       return n;
     });
 
-  if (!unlocked) {
+  // ----- access gate -----
+  if (supabase) {
+    if (!authReady) {
+      return (
+        <div className="recon"><style>{STYLES}</style>
+          <div className="lock panel"><p className="sub">Loading…</p></div>
+        </div>
+      );
+    }
+    if (!session) {
+      const sendLink = async () => {
+        setAuthMsg(null);
+        const { error } = await supabase.auth.signInWithOtp({
+          email: email.trim(),
+          options: { emailRedirectTo: window.location.origin },
+        });
+        setAuthMsg(
+          error
+            ? { err: true, text: error.message }
+            : { err: false, text: "Sign-in link sent — check your email (and spam)." }
+        );
+      };
+      return (
+        <div className="recon"><style>{STYLES}</style>
+          <div className="lock panel">
+            <h1 style={{ margin: 0, fontSize: 20 }}>
+              Commission <span style={{ color: "#5514b4" }}>Reconciliation</span>
+            </h1>
+            <p className="sub" style={{ margin: "6px 0 0" }}>
+              Sign in to view the shared reconciliation. Access is limited to approved emails.
+            </p>
+            <input
+              type="email"
+              value={email}
+              placeholder="you@company.com"
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && email.trim() && sendLink()}
+            />
+            <button onClick={() => email.trim() && sendLink()}>Email me a sign-in link</button>
+            {authMsg && (
+              <p className="sub" style={{ color: authMsg.err ? "#b3261e" : "#14804a", marginTop: 10 }}>{authMsg.text}</p>
+            )}
+          </div>
+        </div>
+      );
+    }
+  }
+
+  if (!supabase && !unlocked) {
     return (
       <div className="recon">
         <style>{STYLES}</style>
@@ -469,9 +585,21 @@ export default function ReconciliationTool() {
       <div className="wrap">
         <div className="head">
           <h1>Commission <span className="accent">Reconciliation</span></h1>
-          <span className="sub" style={{ margin: 0 }}>Cobra · NetSuite · Sch5 — standalone test tool</span>
+          <span className="sub" style={{ margin: 0 }}>Cobra · NetSuite · Sch5 — shared</span>
+          {session && (
+            <span className="sub" style={{ marginLeft: "auto" }}>
+              {session.user?.email}{" · "}
+              <a href="#" onClick={(e) => { e.preventDefault(); supabase.auth.signOut(); }} style={{ color: "#5514b4" }}>Sign out</a>
+            </span>
+          )}
         </div>
-        <p className="sub">Everything runs in your browser. No data leaves this page.</p>
+        <p className="sub">
+          {sharedMeta?.at
+            ? `Shared data last updated by ${sharedMeta.by || "someone"} on ${new Date(sharedMeta.at).toLocaleString("en-GB")}.`
+            : "Upload the three exports once — they're saved and shared with everyone signed in."}
+          {saving && " · Saving…"}
+          {errors.save && <span style={{ color: "#b3261e" }}> · {errors.save}</span>}
+        </p>
 
         {/* uploads */}
         <div className="panel">
