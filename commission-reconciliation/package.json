@@ -1,7 +1,7 @@
 {
   "name": "commission-reconciliation",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "xlsx": "^0.18.5",
+    "@supabase/supabase-js": "^2.45.4",
     "vite": "^5.4.11",
     "@vitejs/plugin-react": "^4.3.4"
   }
