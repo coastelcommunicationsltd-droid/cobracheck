@@ -2176,9 +2176,14 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
 //  Payments Per Agent
 // =========================================================================
 // Total = everything except red. Payable = payable tone. Waiting = claimed + issued.
+// export files often carry a totals/summary row with no identifiers — never treat it as an order
+const isRealLine = (r) =>
+  !!(String(r.netsuiteRef || "").trim() || String(r.orderNum || "").trim() || String(r.company || "").trim());
+
 const summariseGp = (rows, statusRules) => {
   let total = 0, payable = 0, waiting = 0;
   for (const r of rows || []) {
+    if (!isRealLine(r)) continue;
     const gp = r.expected || 0;
     const cat = isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status);
     if (cat === "red") continue;
@@ -2260,6 +2265,25 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 
   const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
 
+  // what payroll saw, per agent per month
+  const staticByAgent = useMemo(() => {
+    const out = {};
+    keys.forEach((mk, i) => {
+      for (const r of statics[mk] || []) {
+        if (!isRealLine(r)) continue;
+        const n = r.partner || r.agent || "(unassigned)";
+        out[n] = out[n] || keys.map(() => ({ total: 0, payable: 0, waiting: 0 }));
+        const gp = r.expected || 0;
+        const cat = isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status);
+        if (cat === "red") continue;
+        out[n][i].total += gp;
+        if (cat === "payable") out[n][i].payable += gp;
+        else out[n][i].waiting += gp;
+      }
+    });
+    return out;
+  }, [statics, keys.join(), statusRules]);
+
   // per agent+month: what has moved since the static snapshot
   const changesFor = useCallback((agent, i) => {
     const mk = keys[i];
@@ -2269,14 +2293,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     const mine = (r) => (r.partner || r.agent || "(unassigned)") === agent;
     const snap = new Map();
     for (const r of snapRows) {
-      if (!mine(r)) continue;
+      if (!mine(r) || !isRealLine(r)) continue;
       const k = lineKey(r);
       if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
       snap.get(k).gp += r.expected || 0;
     }
     const live = new Map();
     for (const r of ns) {
-      if (r.period !== mk || !mine(r)) continue;
+      if (r.period !== mk || !mine(r) || !isRealLine(r)) continue;
       const k = lineKey(r);
       if (!live.has(k)) live.set(k, { ...r, gp: 0 });
       live.get(k).gp += r.expected || 0;
@@ -2285,7 +2309,10 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     for (const [k, b] of live) {
       const a = snap.get(k);
       const nowCat = catOf(b);
-      if (!a) { rows.push({ ...b, cat: nowCat, change: "new", was: null, now: b.gp }); continue; }
+      if (!a) {
+        rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new", was: null, now: b.gp });
+        continue;
+      }
       const wasCat = catOf(a);
       const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
       const catMoved = wasCat !== nowCat;
@@ -2298,7 +2325,11 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
               : statusMoved ? "status-only" : null,
       });
     }
-    for (const [k, a] of snap) if (!live.has(k)) rows.push({ ...a, cat: catOf(a), change: "removed", was: a.gp, now: 0 });
+    for (const [k, a] of snap) {
+      if (live.has(k)) continue;
+      rows.push({ ...a, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
+        change: "removed", was: a.gp, now: 0 });
+    }
     return rows;
   }, [statics, ns, keys.join(), statusRules]);
 
@@ -2508,7 +2539,12 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                           outline: bad && (marked || (g.paid[i] || 0) > 0) ? "2px solid #b3261e" : undefined }}>
                         {basis === "earned" ? (
                           <>
-                            <div><strong>{v ? gbp0(v) : "-"}</strong></div>
+                            {staticByAgent[name] && (
+                              <div style={{ fontSize: 10.5, color: "#5b5676" }}>
+                                Payroll: {gbp0(staticByAgent[name][i].total)}
+                              </div>
+                            )}
+                            <div><strong>Now: {v ? gbp0(v) : "-"}</strong></div>
                             <div style={{ fontSize: 10, color: "#14804a" }}>payable {gbp0(g.payable[i] || 0)}</div>
                             <div style={{ fontSize: 10, color: "#8a5a00" }}>waiting {gbp0(g.claimedIssued[i] || 0)}</div>
                           </>
@@ -2594,8 +2630,42 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
           );
           return (
             <>
-              <p className="note" style={{ marginTop: 6 }}>
-                Compared against the {periodLabel(keys[drill.i])} snapshot. {moved.length} line{moved.length === 1 ? "" : "s"} moved.
+              {(() => {
+                const stat = staticByAgent[drill.agent]?.[drill.i] || { total: 0, payable: 0, waiting: 0 };
+                const g = (shownAgents.find(([n]) => n === drill.agent) || [, blankAgent(keys.length)])[1];
+                const now = { total: g.earned[drill.i] || 0, payable: g.payable[drill.i] || 0, waiting: g.claimedIssued[drill.i] || 0 };
+                const row = (lab, f, cls) => (
+                  <tr>
+                    <td className="left">{lab}</td>
+                    <td className="num mono">{gbp0(f.total)}</td>
+                    <td className="num mono">{gbp0(f.payable)}</td>
+                    <td className="num mono">{gbp0(f.waiting)}</td>
+                  </tr>
+                );
+                return (
+                  <table style={{ marginTop: 8, marginBottom: 10 }}>
+                    <thead><tr>
+                      <th className="left"></th><th className="num">Total</th>
+                      <th className="num">Payable</th><th className="num">Waiting</th>
+                    </tr></thead>
+                    <tbody>
+                      {row("Payroll", stat)}
+                      {row("Now", now)}
+                      <tr style={{ background: "#faf9ff" }}>
+                        <td className="left"><strong>Difference</strong></td>
+                        {["total", "payable", "waiting"].map((f) => {
+                          const d = now[f] - stat[f];
+                          return <td key={f} className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}>
+                            {d > 0 ? "+" : ""}{gbp0(d)}
+                          </td>;
+                        })}
+                      </tr>
+                    </tbody>
+                  </table>
+                );
+              })()}
+              <p className="note" style={{ marginTop: 0 }}>
+                {moved.length} line{moved.length === 1 ? "" : "s"} moved since the {periodLabel(keys[drill.i])} snapshot.
               </p>
               <div style={{ overflowX: "auto" }}>
                 <table>
@@ -3091,9 +3161,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
       const hasNs = r.inNS, hasCb = r.inCobra;
       if (!hasNs || !hasCb) { nException++; continue; }      // only on one side
       const d = (r.paid || 0) - (r.expected || 0);
-      const base = Math.max(Math.abs(r.paid || 0), Math.abs(r.expected || 0), 1);
       if (Math.abs(d) < 0.005) nMatched++;
-      else if (Math.abs(d) / base <= 0.01) nReview++;        // within 1%
       else nException++;
     }
     const nTotal = Math.max(1, nMatched + nReview + nException);
@@ -3163,6 +3231,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
   const flagged = useMemo(() => {
     if (cYear == null) return [];
     const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
+
     const catOf = (r) => (isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status));
     const out = [];
     for (const mk of fyMonthKeys(cYear)) {
@@ -3170,20 +3239,24 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
       if (!snapRows) continue;
       const snap = new Map();
       for (const r of snapRows) {
+        if (!isRealLine(r)) continue;
         const k = lineKey(r);
         if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
         snap.get(k).gp += r.expected || 0;
       }
       const live = new Map();
       for (const r of ns) {
-        if (r.period !== mk) continue;
+        if (r.period !== mk || !isRealLine(r)) continue;
         const k = lineKey(r);
         if (!live.has(k)) live.set(k, { ...r, gp: 0 });
         live.get(k).gp += r.expected || 0;
       }
       for (const [k, b] of live) {
         const a = snap.get(k);
-        if (!a) { out.push({ ...b, mk, cat: catOf(b), was: null, now: b.gp, reason: "New since payroll" }); continue; }
+        if (!a) {
+          out.push({ ...b, mk, cat: catOf(b), wasCat: null, wasStatus: "(not in payroll)", was: null, now: b.gp, reason: "New since payroll" });
+          continue;
+        }
         const wasCat = catOf(a), nowCat = catOf(b);
         const moved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
         const statusMoved = String(a.status || "") !== String(b.status || "");
@@ -3196,7 +3269,10 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
         out.push({ ...b, mk, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp, reason });
       }
       for (const [k, a] of snap) {
-        if (!live.has(k)) out.push({ ...a, mk, cat: catOf(a), was: a.gp, now: 0, reason: "Removed since payroll" });
+        if (!live.has(k)) {
+          out.push({ ...a, mk, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
+            was: a.gp, now: 0, reason: "Removed since payroll" });
+        }
       }
     }
     const rank = (r) => (r.reason.includes("Removed") ? 0 : r.reason.includes("red") ? 1 : 2);
@@ -3330,12 +3406,11 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
         </div>
 
         <div className="panel">
-          <h2>Reconciliation status — NetSuite vs Cobra</h2>
+          <h2>NetSuite vs Cobra</h2>
           <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-            <Donut matched={k.pctMatched} review={k.pctReview} exception={k.pctException} />
+            <Donut matched={k.pctMatched} review={0} exception={k.pctException} />
             <div style={{ fontSize: 13 }}>
               {[["Matched", k.pctMatched, "#14804a", k.nMatched],
-                ["Within 1%", k.pctReview, "#d98a00", k.nReview],
                 ["Mismatch", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
                 <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                   <i style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
@@ -3363,6 +3438,34 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
               })), "flagged-orders.csv")}>Export</button>
             )}
           </div>
+          {flagged.length > 0 && (() => {
+            const t = { was: 0, now: 0 };
+            for (const r of flagged) { t.was += r.was || 0; t.now += r.now || 0; }
+            const counts = flagged.reduce((m, r) => { m[r.reason] = (m[r.reason] || 0) + 1; return m; }, {});
+            return (
+              <div style={{ overflowX: "auto", marginTop: 10, marginBottom: 4 }}>
+                <table>
+                  <thead><tr>
+                    <th className="left">Flagged total</th>
+                    <th className="num">GP at payroll</th><th className="num">GP now</th><th className="num">Difference</th>
+                  </tr></thead>
+                  <tbody>
+                    <tr>
+                      <td className="left">{flagged.length} order{flagged.length === 1 ? "" : "s"}</td>
+                      <td className="num mono">{gbp0(t.was)}</td>
+                      <td className="num mono">{gbp0(t.now)}</td>
+                      <td className={"num mono " + (t.now - t.was >= 0 ? "pos" : "neg")}>
+                        {t.now - t.was > 0 ? "+" : ""}{gbp0(t.now - t.was)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p className="note" style={{ marginTop: 6 }}>
+                  {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}: ${n}`).join(" · ")}
+                </p>
+              </div>
+            );
+          })()}
           {flagged.length === 0 ? (
             <div className="empty">
               {Object.keys(statics).length === 0
