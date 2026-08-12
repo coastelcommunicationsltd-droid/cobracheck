@@ -200,7 +200,7 @@ const KEEP_COLS = {
   sch5: ["MAIN ORDER NUM", "ADT REF", "OPPORTUNITY ID", "LE CODE", "CUSTOMER NAME",
     "ORDER STATUS", "ORDER SUB STATUS", "CANCEL DATE", "SOV", "COMMISSION FLAG",
     "PRODUCT SUB NAME1", "TRANSACTIONAL", "RECENT CANCELLATION", "CLOSED DATE",
-    "ORDER DATE", "REPORTING MONTH"],
+    "ORDER DATE", "REPORTING MONTH", "Sch5 Order", "ORDER"],
 };
 const normHead = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
 const slimFileForSave = (f, which) => {
@@ -313,7 +313,12 @@ const sch5Row = (r) => ({
   product: firstDefined(pick(r, ["PRODUCT SUB NAME1"])),
   transactional: firstDefined(pick(r, ["TRANSACTIONAL"])),
   recentCancel: firstDefined(pick(r, ["RECENT CANCELLATION"])),
-  date: pick(r, ["CLOSED DATE", "ORDER DATE", "REPORTING MONTH"]),
+  date: firstDefined(pickExact(r, ["ORDER DATE"]), pickExact(r, ["CLOSED DATE"]), pickExact(r, ["REPORTING MONTH"])),
+  // "Order" flag: use a literal ORDER column if the export has one, else COMMISSION FLAG
+  orderFlag: firstDefined(pickExact(r, ["SCH5 ORDER"]), pickExact(r, ["ORDER"]), pickExact(r, ["COMMISSION FLAG"])),
+  orderFlagCol: pickExact(r, ["SCH5 ORDER"]) != null ? "SCH5 ORDER"
+    : pickExact(r, ["ORDER"]) != null ? "ORDER"
+      : pickExact(r, ["COMMISSION FLAG"]) != null ? "COMMISSION FLAG" : null,
   raw: r,
 });
 
@@ -1724,7 +1729,8 @@ function useSourceLines(files) {
   return useMemo(() => {
     const ns = (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date), rawDate: r.date }));
     const cb = (files.cobra?.rows || []).map(cobraRow).map((r) => ({ ...r, period: cobraPeriod(r) }));
-    return { ns, cb };
+    const s5 = (files.sch5?.rows || []).map(sch5Row).map((r) => ({ ...r, period: monthKey(r.date) }));
+    return { ns, cb, s5 };
   }, [files]);
 }
 
@@ -2429,53 +2435,65 @@ function Settings(props) {
 //  Overview — the landing page
 // =========================================================================
 function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) {
-  const { ns, cb } = useSourceLines(files);
+  const { ns, cb, s5 } = useSourceLines(files);
 
   // ---- headline position ----
   const k = useMemo(() => {
-    let received = 0, matched = 0, underpaid = 0, overpaid = 0, unallocated = 0;
+    let nsGp = 0, cobraPaymentCol = 0, cobraUnmatched = 0, sch5Unmatched = 0;
     let nMatched = 0, nReview = 0, nException = 0;
     for (const r of records) {
-      const paid = r.paid || 0, exp = r.expected || 0;
-      received += paid;
-      if (r.inCobra && !r.inNS) { unallocated += paid; nException++; continue; }
-      if (!r.inCobra) { if (r.flags.some((f) => f.sev === 3)) nException++; continue; }
-      const d = paid - exp;
-      if (Math.abs(d) < 0.005) { matched += paid; nMatched++; }
-      else if (d < 0) { underpaid += -d; nReview++; }
-      else { overpaid += d; nReview++; }
-      if (r.flags.some((f) => f.sev === 3)) { nException++; nReview--; }
+      nsGp += r.expected || 0;
+      cobraPaymentCol += r.recordedCobra || 0;              // NetSuite "Cobra Payment" column
+      if (r.inCobra && !r.inNS) cobraUnmatched += r.paid || 0;   // C but not N
+      if (r.inSch5 && !r.inNS) sch5Unmatched += r.s5Sov || 0;    // S but not N
+      if (r.flags.some((f) => f.sev === 3)) nException++;
+      else if (r.flags.length) nReview++;
+      else nMatched++;
     }
     const nTotal = Math.max(1, nMatched + nReview + nException);
     return {
-      received, matched, underpaid, overpaid, unallocated,
+      nsGp, cobraPaymentCol, underpaid: nsGp - cobraPaymentCol, cobraUnmatched, sch5Unmatched,
       pctMatched: (nMatched / nTotal) * 100,
-      pctReview: (Math.max(0, nReview) / nTotal) * 100,
+      pctReview: (nReview / nTotal) * 100,
       pctException: (nException / nTotal) * 100,
-      nMatched, nReview: Math.max(0, nReview), nException,
+      nMatched, nReview, nException,
     };
   }, [records]);
 
-  // ---- monthly position: expected vs what NetSuite says Cobra paid vs what Cobra actually paid ----
+  // ---- monthly series, for both GP and SOV ----
+  const [mode, setMode] = useState("gp");
   const monthly = useMemo(() => {
     const m = new Map();
     const get = (p) => {
-      if (!m.has(p)) m.set(p, { p, nsGp: 0, nsPay: 0, cbPay: 0 });
+      if (!m.has(p)) m.set(p, { p, nsGp: 0, cbPaid: 0, nsSov: 0, s5Sov: 0, cbSov: 0 });
       return m.get(p);
     };
-    const seen = new Set();
     for (const r of ns) {
       if (!r.period) continue;
       const e = get(r.period);
       e.nsGp += r.expected || 0;
-      const dk = String(r.docNo ?? r.orderNum ?? "");
-      if (r.recordedCobra != null && !seen.has(dk)) { seen.add(dk); e.nsPay += r.recordedCobra; }
+      e.nsSov += r.sov || 0;                       // already Sales Closer rows only
     }
-    for (const r of cb) { if (r.period) get(r.period).cbPay += r.paid || 0; }
+    for (const r of cb) {
+      if (!r.period) continue;
+      const e = get(r.period);
+      e.cbPaid += r.paid || 0;                     // Commission Paid
+      e.cbSov += r.sov || 0;                       // Contract Value
+    }
+    for (const r of s5) {
+      if (!r.period) continue;
+      if (!isYes(r.orderFlag)) continue;           // only rows flagged Y
+      get(r.period).s5Sov += r.sov || 0;
+    }
     return [...m.values()].sort((a, b) => a.p.localeCompare(b.p)).slice(-12);
-  }, [ns, cb]);
+  }, [ns, cb, s5]);
 
-  const maxY = Math.max(1, ...monthly.flatMap((d) => [d.nsGp, d.nsPay, d.cbPay]));
+  const flagCol = useMemo(() => s5.find((r) => r.orderFlagCol)?.orderFlagCol || null, [s5]);
+
+  const SERIES = mode === "gp"
+    ? [["nsGp", "#1e64d6", "Total GP (NetSuite)"], ["cbPaid", "#8b5cf6", "Paid on Cobra"]]
+    : [["nsSov", "#1e64d6", "SOV (NetSuite)"], ["s5Sov", "#12a594", "SOV (Sch5)"], ["cbSov", "#8b5cf6", "Contract Value (Cobra)"]];
+  const maxY = Math.max(1, ...monthly.flatMap((d) => SERIES.map(([kk]) => d[kk])));
   const niceMax = Math.ceil(maxY / 50000) * 50000 || maxY;
 
   // ---- exceptions needing action ----
@@ -2494,7 +2512,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
   const changes = useMemo(() => {
     if (!snapshot) return null;
     return {
-      received: k.received - (snapshot.received || 0),
+      received: k.nsGp - (snapshot.received || 0),
       entitled: pay.entitled - (snapshot.entitled || 0),
       exceptions: k.nException - (snapshot.nException || 0),
     };
@@ -2503,7 +2521,6 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
   const W = 640, H = 230, padL = 46, padB = 26, padT = 8;
   const bw = monthly.length ? (W - padL - 8) / monthly.length : 0;
   const y = (v) => padT + (H - padT - padB) * (1 - v / niceMax);
-  const SERIES = [["nsGp", "#1e64d6", "NetSuite GP"], ["nsPay", "#12a594", "NetSuite → Cobra"], ["cbPay", "#8b5cf6", "Cobra paid"]];
 
   const Card = ({ colour, label, value, sub2, subColour }) => (
     <div className="kpic" style={{ borderTopColor: colour }}>
@@ -2518,24 +2535,48 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
         <button className="btn" style={{ background: "#1e64d6", color: "#fff", padding: "9px 14px" }}
           onClick={() => saveSnapshot({
-            at: new Date().toISOString(), received: k.received, entitled: pay.entitled, nException: k.nException,
+            at: new Date().toISOString(), received: k.nsGp, entitled: pay.entitled, nException: k.nException,
           })}>
           {snapshot?.at ? `Re-lock snapshot (last ${new Date(snapshot.at).toLocaleDateString("en-GB")})` : "Lock snapshot"}
         </button>
       </div>
 
       <div className="kpis5">
-        <Card colour="#1e64d6" label="BT Payments Received" value={gbp0(k.received)} />
-        <Card colour="#14804a" label="Matched" value={gbp0(k.matched)} sub2={k.pctMatched.toFixed(1) + "%"} />
-        <Card colour="#d98a00" label="Underpaid" value={gbp0(k.underpaid)} />
-        <Card colour="#b3261e" label="Overpaid" value={gbp0(k.overpaid)} />
-        <Card colour="#5b6472" label="Unallocated" value={gbp0(k.unallocated)} />
+        <Card colour="#1e64d6" label="Total GP from NetSuite" value={gbp0(k.nsGp)}
+          sub2="Sales Agent GP, all rows" subColour="#8a8aa3" />
+        <Card colour="#14804a" label="Matched" value={gbp0(k.cobraPaymentCol)}
+          sub2={`NetSuite "Cobra Payment" · ${k.nsGp ? ((k.cobraPaymentCol / k.nsGp) * 100).toFixed(1) : "0.0"}%`} subColour="#8a8aa3" />
+        <Card colour="#d98a00" label="Underpaid" value={gbp0(k.underpaid)}
+          sub2="GP not yet paid by Cobra" subColour="#8a8aa3" />
+        <Card colour="#b3261e" label="Overpaid" value="—"
+          sub2="needs a database change" subColour="#8a8aa3" />
+        <div className="kpic" style={{ borderTopColor: "#5b6472" }}>
+          <div className="lab">Unallocated</div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginTop: 4 }}>
+            <div>
+              <div className="val" style={{ color: "#5b6472", fontSize: 17 }}>{gbp0(k.cobraUnmatched)}</div>
+              <div className="sub2" style={{ color: "#8a8aa3", fontWeight: 500 }}>Cobra GP, no NetSuite</div>
+            </div>
+            <div>
+              <div className="val" style={{ color: "#5b6472", fontSize: 17 }}>{gbp0(k.sch5Unmatched)}</div>
+              <div className="sub2" style={{ color: "#8a8aa3", fontWeight: 500 }}>Sch5 SOV, no NetSuite</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="two" style={{ marginTop: 14 }}>
         <div className="panel">
-          <h2>Monthly payment position</h2>
-          <div className="legend">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <h2 style={{ margin: 0 }}>Monthly {mode === "gp" ? "GP" : "SOV"} position</h2>
+            <div style={{ display: "flex", gap: 4 }}>
+              {[["gp", "GP"], ["sov", "SOV"]].map(([v, l]) => (
+                <button key={v} className={"tab " + (mode === v ? "active" : "")}
+                  style={{ padding: "5px 14px", fontSize: 12.5 }} onClick={() => setMode(v)}>{l}</button>
+              ))}
+            </div>
+          </div>
+          <div className="legend" style={{ marginTop: 10 }}>
             {SERIES.map(([kk, c, l]) => <span key={kk}><i style={{ background: c }} />{l}</span>)}
           </div>
           {monthly.length === 0 ? <div className="empty">No dated rows yet.</div> : (
@@ -2552,9 +2593,10 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
                 {monthly.map((d, i) => (
                   <g key={d.p}>
                     {SERIES.map(([kk, c], j) => {
+                      const n = SERIES.length, slot = (bw - 8) / n;
                       const h = Math.max(0, y(0) - y(d[kk]));
-                      return <rect key={kk} x={padL + i * bw + j * (bw / 3.6) + 3} y={y(d[kk])}
-                        width={Math.max(2, bw / 4.2)} height={h} fill={c} rx="1.5" />;
+                      return <rect key={kk} x={padL + i * bw + 4 + j * slot} y={y(d[kk])}
+                        width={Math.max(2, slot - 2)} height={h} fill={c} rx="1.5" />;
                     })}
                     <text x={padL + i * bw + bw / 2} y={H - 8} textAnchor="middle" fontSize="9" fill="#8a8aa3">
                       {periodLabel(d.p)}
@@ -2563,6 +2605,13 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
                 ))}
               </svg>
             </div>
+          )}
+          {mode === "sov" && (
+            <p className="note">
+              Sch5 SOV counts only rows flagged Y in{" "}
+              <span className="mono">{flagCol || "(no flag column found)"}</span>
+              {flagCol && flagCol !== "SCH5 ORDER" ? " — no \"Sch5 Order\" column in this export, so this is the closest match." : ""}
+            </p>
           )}
         </div>
 
@@ -2654,7 +2703,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
             ) : (
               <table>
                 <tbody>
-                  <tr><td className="left">BT payments received</td>
+                  <tr><td className="left">Total GP from NetSuite</td>
                     <td className={"num mono " + (changes.received >= 0 ? "pos" : "neg")}>{gbp0(changes.received)}</td></tr>
                   <tr><td className="left">Agents entitled</td>
                     <td className={"num mono " + (changes.entitled >= 0 ? "pos" : "neg")}>{gbp0(changes.entitled)}</td></tr>
