@@ -106,7 +106,15 @@ async function parseWorkbook(file) {
   const isCsv = /\.(csv|tsv|txt)$/i.test(file.name || "");
   let wb;
   if (isCsv) {
-    const text = await file.text();
+    // Excel writes CSVs as Windows-1252, so "£" is a byte UTF-8 can't decode.
+    // Try strict UTF-8 first, then fall back — otherwise £ turns into "?" and numbers break.
+    const buf = await file.arrayBuffer();
+    let text;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
+    } catch {
+      text = new TextDecoder("windows-1252").decode(buf);
+    }
     wb = XLSX.read(text, { type: "string", cellDates: true });
   } else {
     const buf = await file.arrayBuffer();
@@ -156,7 +164,11 @@ const KEEP_COLS = {
   netsuite: ["Opp ID", "Order ref", "Company Name", "Order Status", "Contract Value",
     "Item: Name (Grouped)", "Item Name", "Product GP", "Cobra Payment", "Item Paid",
     "Overpayment", "Accelerator?", "Admin Agent", "Customer Le", "Netsuite Date",
-    "Product Group 2", "Product Group2", "Product Group", "Netsuite Ref"],
+    "Product Group 2", "Product Group2", "Product Group", "Netsuite Ref",
+    // new-format NetSuite report
+    "Sales Agent GP", "Date", "Item: Product Group 2", "Document Number", "Partner",
+    "Partner Role: Name", "Team", "Sales Team Issue Dirty Order?", "Item: Schedule 5",
+    "Customer CUG", "Order Status Last Changed Date", "Class (Item): Name", "Description"],
   cobra: ["Job Header", "Opty ID", "LE Code", "Customer Name", "Status", "Month",
     "Contract Value", "Commission Due", "Commission Paid", "Measure", "Plan Name",
     "Prod Code", "Closed Date", "Order Date", "Month", "FY"],
@@ -181,21 +193,38 @@ const slimFileForSave = (f, which) => {
 const nsRow = (r) => ({
   src: "netsuite",
   oppId: firstDefined(pick(r, ["Opp ID"])),
-  orderNum: normOrder(pick(r, ["Order ref"])),
+  // the new report has no BT order number, so fall back to Opp ID / Document Number
+  // new report carries the BT order reference in the "Description" column
+  orderNum: normOrder(firstDefined(
+    pick(r, ["Order ref"]), pick(r, ["Description"]), pick(r, ["Opp ID"]), pick(r, ["Document Number"]))),
+  docNo: firstDefined(pick(r, ["Document Number"])),
+  partner: firstDefined(pick(r, ["Partner"])),
+  partnerRole: firstDefined(pick(r, ["Partner Role: Name"])),
+  team: firstDefined(pick(r, ["Team"])),
+  dirty: firstDefined(pick(r, ["Sales Team Issue Dirty Order?"])),
+  schedule5: firstDefined(pick(r, ["Item: Schedule 5"])),
+  cug: firstDefined(pick(r, ["Customer CUG"])),
   company: firstDefined(pick(r, ["Company Name"])),
   status: firstDefined(pick(r, ["Order Status"])),
-  sov: money(pick(r, ["Contract Value"])),
+  // SOV is only counted on the Sales Closer's row, so the same order isn't counted per partner
+  sov: (() => {
+    const role = pick(r, ["Partner Role: Name"]);
+    if (role != null && role !== "" && !/sales closer/i.test(String(role))) return null;
+    return money(pick(r, ["Contract Value"]));
+  })(),
   product: firstDefined(pick(r, ["Item: Name (Grouped)", "Item Name"])),
-  expected: money(pick(r, ["Product GP"])), // what we expect to be paid
+  expected: money(firstDefined(pick(r, ["Product GP"]), pick(r, ["Sales Agent GP"]))),
   recordedCobra: money(pick(r, ["Cobra Payment"])), // what NS records Cobra paid
   itemPaid: firstDefined(pick(r, ["Item Paid"])),
+  // new report has no "Item Paid" flag — Order Status "Paid" carries it instead
+  statusPaid: /(^|\b)paid(\b|$)/i.test(String(pick(r, ["Order Status"]) || "")),
   overpayment: firstDefined(pick(r, ["Overpayment"])),
   accelerator: firstDefined(pick(r, ["Accelerator?", "Accelerator"])),
   agent: firstDefined(pick(r, ["Admin Agent"])),
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
-  date: pick(r, ["Netsuite Date"]),
-  productGroup2: firstDefined(pick(r, ["Product Group 2", "Product Group2"])),
-  netsuiteRef: firstDefined(pick(r, ["Netsuite Ref", "NetSuite Ref"])),
+  date: firstDefined(pick(r, ["Netsuite Date"]), pick(r, ["Date"]), pick(r, ["Order Status Last Changed Date"])),
+  productGroup2: firstDefined(pick(r, ["Item: Product Group 2"]), pick(r, ["Product Group 2", "Product Group2"])),
+  netsuiteRef: firstDefined(pick(r, ["Netsuite Ref", "NetSuite Ref"]), pick(r, ["Document Number"])),
   raw: r,
 });
 
@@ -260,6 +289,23 @@ const sch5Row = (r) => ({
   raw: r,
 });
 
+// In the new NetSuite report the same line-item appears once PER PARTNER, repeating
+// Contract Value and Cobra Payment on every row. Those must be counted once per item,
+// while Sales Agent GP is genuinely per-partner and IS summed across rows.
+const sumOncePerDoc = (rows, valFn) => {
+  const seen = new Set();
+  let total = 0;
+  for (const r of rows) {
+    const v = valFn(r);
+    if (v == null) continue;
+    const k = String(r.docNo ?? r.orderNum ?? "");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    total += v;
+  }
+  return total;
+};
+
 const groupBy = (rows, keyFn) => {
   const m = new Map();
   for (const r of rows) {
@@ -297,10 +343,10 @@ function reconcile(files, tol, period = "all") {
     const inSch5 = s5L.length > 0;
 
     const expected = sum(nsL.map((r) => r.expected)); // NS Product GP
-    const recordedCobra = sum(nsL.map((r) => r.recordedCobra)); // NS "Cobra Payment"
+    const recordedCobra = sumOncePerDoc(nsL, (r) => r.recordedCobra); // once per Document Number
     const due = sum(cbL.map((r) => r.due)); // Cobra Commission Due
     const paid = sum(cbL.map((r) => r.paid)); // Cobra Commission Paid
-    const nsSov = sum(nsL.map((r) => r.sov));
+    const nsSov = sum(nsL.map((r) => r.sov)); // already restricted to Sales Closer rows
     const s5Sov = sum(s5L.map((r) => r.sov));
     const cobraSov = sum(cbL.map((r) => r.sov));
 
@@ -319,7 +365,7 @@ function reconcile(files, tol, period = "all") {
     const company =
       firstDefined(nsL[0]?.company, cbL[0]?.company, s5L[0]?.company) || "(no name)";
     const agent = firstDefined(nsL[0]?.agent);
-    const anyUnpaid = nsL.some((r) => r.itemPaid != null && !isYes(r.itemPaid));
+    const anyUnpaid = nsL.some((r) => (r.itemPaid != null ? !isYes(r.itemPaid) : !r.statusPaid));
     const overpaymentFlag = nsL.some((r) => r.overpayment != null && r.overpayment !== "");
 
     const payDelta = inNS && inCobra ? paid - expected : null; // BT paid vs expected
@@ -359,7 +405,7 @@ function reconcile(files, tol, period = "all") {
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
       period: monthKey(nsL[0]?.date) || (cbL[0] ? cobraPeriod(cbL[0]) : null) || monthKey(s5L[0]?.date) || null,
       product: firstDefined(nsL[0]?.product, cbL[0]?.product, s5L[0]?.product),
-      productGroup: productGroupOf(firstDefined(...nsL.map((x) => x.product))),
+      productGroup: firstDefined(...nsL.map((x) => x.productGroup2)) || productGroupOf(firstDefined(...nsL.map((x) => x.product))),
       netsuiteRef: firstDefined(...nsL.map((x) => x.netsuiteRef)),
       nsStatus: firstDefined(...nsL.map((x) => x.status)),
       status: firstDefined(nsL[0]?.status, cbL[0]?.status, s5L[0]?.status),
@@ -1534,14 +1580,13 @@ function useSourceLines(files) {
 //  WIP Tracker — replica of the monthly GP/WIP sheet
 // =========================================================================
 function WipTracker({ files, settings, saveSettings, settingsSaving }) {
-  const { ns, cb } = useSourceLines(files);
+  const { ns } = useSourceLines(files);
 
   const years = useMemo(() => {
     const s = new Set();
     ns.forEach((r) => { const f = fyStartOf(r.period); if (f) s.add(f); });
-    cb.forEach((r) => { const f = fyStartOf(r.period); if (f) s.add(f); });
     return [...s].sort((a, b) => b - a);
-  }, [ns, cb]);
+  }, [ns]);
 
   const [fy, setFy] = useState(null);
   const year = fy ?? years[0] ?? null;
@@ -1552,22 +1597,21 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
     const z = () => keys.map(() => 0);
     const latestStats = z(), paidCobra = z(), unpaidWip = z(), accOwed = z(), accPaid = z(), overage = z();
     const idx = new Map(keys.map((k, i) => [k, i]));
+    const paySeen = new Set();
     for (const r of ns) {
       const i = idx.get(r.period);
       if (i == null) continue;
       const gp = r.expected || 0;
       latestStats[i] += gp;
-      if (r.itemPaid != null && !isYes(r.itemPaid)) unpaidWip[i] += gp;
+      const payKey = String(r.docNo ?? r.orderNum ?? "");
+      if (r.recordedCobra != null && !paySeen.has(payKey)) { paySeen.add(payKey); paidCobra[i] += r.recordedCobra; }
+      const unpaid = r.itemPaid != null ? !isYes(r.itemPaid) : !r.statusPaid;
+      if (unpaid) unpaidWip[i] += gp;
       if (isYes(r.accelerator)) { accOwed[i] += gp; accPaid[i] += r.recordedCobra || 0; }
       overage[i] += money(r.overpayment) || 0;
     }
-    for (const r of cb) {
-      const i = idx.get(r.period);
-      if (i == null) continue;
-      paidCobra[i] += r.paid || 0;
-    }
     return { latestStats, paidCobra, unpaidWip, accOwed, accPaid, overage };
-  }, [ns, cb, keys.join()]);
+  }, [ns, keys.join()]);
 
   // ---- manual rows, stored in shared settings ----
   const wipAll = settings.wip || {};
@@ -1635,22 +1679,21 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 
   // unpaid WIP split by product group, for the summary strip
   const diag = useMemo(() => {
-    let nsIn = 0, cbIn = 0, nsNoDate = 0, nsOther = 0;
+    let nsIn = 0, nsNoDate = 0, nsOther = 0;
     for (const r of ns) {
       if (!r.period) nsNoDate++;
       else if (fyStartOf(r.period) === year) nsIn++;
       else nsOther++;
     }
-    for (const r of cb) if (r.period && fyStartOf(r.period) === year) cbIn++;
-    return { nsIn, cbIn, nsNoDate, nsOther };
-  }, [ns, cb, year]);
+    return { nsIn, nsNoDate, nsOther };
+  }, [ns, year]);
 
   const wipByProduct = useMemo(() => {
     const m = new Map();
     for (const r of ns) {
       if (fyStartOf(r.period) !== year) continue;
-      if (r.itemPaid == null || isYes(r.itemPaid)) continue;
-      const g = productGroupOf(r.product) || "Other";
+      if (r.itemPaid != null ? isYes(r.itemPaid) : r.statusPaid) continue;
+      const g = r.productGroup2 || productGroupOf(r.product) || "Other";
       m.set(g, (m.get(g) || 0) + (r.expected || 0));
     }
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
@@ -1684,7 +1727,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
             </tr></tbody>
           </table>
         </div>
-        <p className="note">Unpaid WIP = NetSuite GP where Item Paid is not "Yes", grouped by product.</p>
+        <p className="note">Unpaid WIP = NetSuite GP where Item Paid is not "Yes", grouped by product. This page reads the NetSuite report only.</p>
       </div>
 
       <div className="panel">
@@ -1734,9 +1777,9 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           </table>
         </div>
         <p className="note">
-          <strong>Where the months come from:</strong> NetSuite rows are placed by <span className="mono">Netsuite Date</span> (read as day/month/year);
-          Cobra rows by its own <span className="mono">Month</span> + <span className="mono">FY</span> columns.
-          {" "}{diag.nsIn} NetSuite and {diag.cbIn} Cobra rows fall in {fyLabel(year)}; {diag.nsNoDate} NetSuite rows have no readable date
+          <strong>Source:</strong> this page uses the NetSuite report only. Rows are placed by
+          {" "}<span className="mono">Netsuite Date</span> (read as day/month/year).
+          {" "}{diag.nsIn} rows fall in {fyLabel(year)}; {diag.nsNoDate} have no readable date
           {diag.nsOther > 0 ? ` and ${diag.nsOther} sit in other years` : ""}.
         </p>
         <p className="note">
