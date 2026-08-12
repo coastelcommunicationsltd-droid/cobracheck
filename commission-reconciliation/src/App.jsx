@@ -65,16 +65,26 @@ const gbp = (n) =>
 const firstDefined = (...xs) => xs.find((x) => x != null && x !== "") ?? null;
 
 // derive a YYYY-MM key from many date shapes (Date, ISO string, UK D/M/Y, YYYYMM)
+// Dates are UK format: day/month/year. Never let JS parse "12/8/2026" itself —
+// it reads that as 8 December (US), which is how rows ended up in the wrong month.
 const monthKey = (v) => {
   if (v == null || v === "") return null;
-  if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}`;
   const s = String(v).trim();
-  let m = s.match(/^(\d{4})-(\d{2})/); // ISO
+  // day/month/year, with optional time — checked BEFORE anything else
+  let m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+  if (m) {
+    const day = Number(m[1]), mon = Number(m[2]);
+    const y = m[3].length === 2 ? "20" + m[3] : m[3];
+    if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) return `${y}-${String(mon).padStart(2, "0")}`;
+    // if the 2nd part can't be a month, the file is genuinely month/day — fall back
+    if (day >= 1 && day <= 12) return `${y}-${String(day).padStart(2, "0")}`;
+    return null;
+  }
+  m = s.match(/^(\d{4})-(\d{2})/); // ISO yyyy-mm
   if (m) return `${m[1]}-${m[2]}`;
-  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/); // UK day/month/year
-  if (m) { const y = m[3].length === 2 ? "20" + m[3] : m[3]; return `${y}-${String(Number(m[2])).padStart(2, "0")}`; }
   m = s.match(/^(\d{4})(\d{2})$/); // YYYYMM (e.g. 202601)
   if (m) return `${m[1]}-${m[2]}`;
+  if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}`;
   return null;
 };
 const periodLabel = (key) => {
@@ -127,7 +137,7 @@ async function parseWorkbook(file) {
     } catch {
       text = new TextDecoder("windows-1252").decode(buf);
     }
-    wb = XLSX.read(text, { type: "string", cellDates: true });
+    wb = XLSX.read(text, { type: "string", raw: true, cellDates: false, cellText: false });
   } else {
     const buf = await file.arrayBuffer();
     wb = XLSX.read(buf, { cellDates: true });
@@ -145,7 +155,7 @@ async function parseWorkbook(file) {
     }
   }
   const ws = wb.Sheets[best];
-  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false });
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, blankrows: false, raw: true });
   // find header row (first with >=3 non-empty string cells)
   let hi = 0;
   for (let i = 0; i < Math.min(aoa.length, 12); i++) {
