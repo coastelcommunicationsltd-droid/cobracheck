@@ -349,6 +349,8 @@ const sumOncePerDoc = (rows, valFn) => {
 // limit on large exports. Store them column-wise (headers once, values as arrays) and
 // write them in chunks so no single request is too big.
 const CHUNK_ROWS = 1500;
+// fixed match tolerance — the on-screen control was removed; put it back if it is ever needed
+const TOLERANCE = { abs: 1, pct: 1 };
 
 const packRows = (rows) => {
   const cols = [];
@@ -719,7 +721,6 @@ export default function ReconciliationTool() {
   const [files, setFiles] = useState({ cobra: null, netsuite: null, sch5: null });
   const [errors, setErrors] = useState({});
   const [tab, setTab] = useState("overview");
-  const [tol, setTol] = useState({ abs: 1, pct: 1 });
   const [expanded, setExpanded] = useState(new Set());
   const [session, setSession] = useState(null);
   const [authReady, setAuthReady] = useState(false);
@@ -893,15 +894,20 @@ export default function ReconciliationTool() {
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
-  const saveSettings = useCallback(async (next) => {
+  const settingsTimer = useRef(null);
+  const saveSettings = useCallback((next) => {
     setSettings(next);
+    settingsRef.current = next;
     if (!supabase || !session) return;
     setSettingsSaving(true);
-    await supabase.from("recon_datasets").upsert(
-      { id: "settings", cobra: next, uploaded_by: session.user?.email || null, uploaded_at: new Date().toISOString() },
-      { onConflict: "id" }
-    );
-    setSettingsSaving(false);
+    if (settingsTimer.current) clearTimeout(settingsTimer.current);
+    settingsTimer.current = setTimeout(() => {
+      supabase.from("recon_datasets").upsert(
+        { id: "settings", cobra: settingsRef.current, uploaded_by: session.user?.email || null,
+          uploaded_at: new Date().toISOString() },
+        { onConflict: "id" }
+      ).then(() => setSettingsSaving(false), () => setSettingsSaving(false));
+    }, 1200);
   }, [session]);
 
   const snapshot = settings.snapshot || null;
@@ -1040,7 +1046,16 @@ export default function ReconciliationTool() {
     return { ...out, ...(settings.risk || {}) };
   }, [statusConfig, settings.risk]);
 
-  const result = useMemo(() => reconcile(files, tol, period, effectiveStatusRules), [files, tol, period, effectiveStatusRules]);
+  const result = useMemo(() => reconcile(files, TOLERANCE, period, effectiveStatusRules),
+    [files, period, effectiveStatusRules]);
+
+  // 30k+ rows mapped through the extractors is the single most expensive thing here,
+  // so do it once and share it rather than once per tab.
+  const sources = useMemo(() => ({
+    ns: (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date), rawDate: r.date })),
+    cb: (files.cobra?.rows || []).map(cobraRow).map((r) => ({ ...r, period: cobraPeriod(r) })),
+    s5: (files.sch5?.rows || []).map(sch5Row).map((r) => ({ ...r, period: monthKey(r.date) })),
+  }), [files]);
   const anyLoaded = files.cobra || files.netsuite || files.sch5;
   const allLoaded = files.cobra && files.netsuite && files.sch5;
 
@@ -1215,13 +1230,6 @@ export default function ReconciliationTool() {
                   <option key={p} value={p}>{periodLabel(p)}</option>
                 ))}
               </select>
-              <span style={{ width: 18 }} />
-              <span>Match tolerance:</span>
-              <label>£<input type="number" value={tol.abs} min={0} step={0.5}
-                onChange={(e) => setTol((t) => ({ ...t, abs: Number(e.target.value) }))} /></label>
-              <label>or <input type="number" value={tol.pct} min={0} step={0.5}
-                onChange={(e) => setTol((t) => ({ ...t, pct: Number(e.target.value) }))} />%</label>
-              <span style={{ color: "#8a8aa3" }}>anything within this counts as a match.</span>
             </div>
           </div>
         )}
@@ -1254,17 +1262,17 @@ export default function ReconciliationTool() {
         {tab !== "settings" && (anyLoaded || tab === "overview") && (
           <>
             {tab === "overview" && (
-              <Overview records={result.records} files={files} settings={settings}
+              <Overview sources={sources} records={result.records} files={files} settings={settings}
                 snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab}
                 supabase={supabase} session={session} statusRules={effectiveStatusRules} />
             )}
 
             {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
 
-            {tab === "wip" && <WipTracker files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings}
+            {tab === "wip" && <WipTracker sources={sources} files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings}
               settingsSaving={settingsSaving} supabase={supabase} session={session} />}
 
-            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
+            {tab === "agents" && <AgentPayments sources={sources} files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
               dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}}
               managers={staffManagers} statusRules={effectiveStatusRules} supabase={supabase} session={session} />}
 
@@ -1776,21 +1784,22 @@ const gbp0 = (n) =>
   n == null ? "-" : new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP", maximumFractionDigits: 0 }).format(n);
 
 // pull NetSuite + Cobra lines out of the loaded files (unfiltered by the month selector)
-function useSourceLines(files) {
+function useSourceLines(files, shared) {
   return useMemo(() => {
+    if (shared) return shared;
     const ns = (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date), rawDate: r.date }));
     const cb = (files.cobra?.rows || []).map(cobraRow).map((r) => ({ ...r, period: cobraPeriod(r) }));
     const s5 = (files.sch5?.rows || []).map(sch5Row).map((r) => ({ ...r, period: monthKey(r.date) }));
     return { ns, cb, s5 };
-  }, [files]);
+  }, [files, shared]);
 }
 
 // =========================================================================
 //  WIP Tracker — replica of the monthly GP/WIP sheet
 // =========================================================================
-function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, session }) {
+function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, session , sources }) {
   const statusSettings = settings.risk || {};
-  const { ns } = useSourceLines(files);
+  const { ns } = useSourceLines(files, sources);
 
   const years = useMemo(() => {
     const s = new Set();
@@ -2175,9 +2184,9 @@ const blankAgent = (n) => ({
 });
 
 function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {}, dbPlansByMonth = {}, dbPlanNames = {},
-  managers = {}, statusRules = {}, supabase, session }) {
+  managers = {}, statusRules = {}, supabase, session , sources }) {
   const monthlyPlans = settings.payplanMonthly || {};
-  const { ns, cb } = useSourceLines(files);
+  const { ns, cb } = useSourceLines(files, sources);
   const [basis, setBasis] = useState("earned");
 
   const years = useMemo(() => {
@@ -3164,8 +3173,8 @@ function Settings(props) {
 // =========================================================================
 //  Overview — the landing page
 // =========================================================================
-function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, supabase, session, statusRules = {} }) {
-  const { ns, cb, s5 } = useSourceLines(files);
+function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, supabase, session, statusRules = {} , sources }) {
+  const { ns, cb, s5 } = useSourceLines(files, sources);
 
   // financial years present across all three sources
   const chartYears = useMemo(() => {
