@@ -627,6 +627,14 @@ tr.click:hover { background:#faf9ff; }
 .wip tbody tr:hover .lbl { background:#faf9ff; }
 .wip .grp td { border-top:2px solid #e4e1f0; }
 .wip .tot { background:#faf9ff; font-weight:700; }
+.pay table { font-size:12px; }
+.pay th { padding:6px 7px; font-size:10px; background:#f7f6fc; }
+.pay td { padding:4px 7px; line-height:1.25; }
+.pay .agent { position:sticky; left:0; background:#fff; z-index:2; box-shadow:1px 0 0 #eceaf4; min-width:150px; }
+.pay tbody tr:hover .agent { background:#faf9ff; }
+.pay tbody tr:hover { background:#faf9ff; }
+.pay .moves td { background:#f4f2fd; font-weight:600; }
+.pay .moves .agent { background:#f4f2fd; }
 .wip input { width:78px; padding:3px 5px; border:1px solid #e2e0ee; border-radius:5px; font-size:12px;
   text-align:center; background:#fbfaff; font-variant-numeric:tabular-nums; }
 .wip input:focus { outline:2px solid #c4bce6; background:#fff; }
@@ -2310,14 +2318,18 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const a = snap.get(k);
       const nowCat = catOf(b);
       if (!a) {
-        rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new", was: null, now: b.gp });
+        rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new", was: null, now: b.gp,
+          becamePayable: nowCat === "payable", lostPayable: false });
         continue;
       }
       const wasCat = catOf(a);
       const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
       const catMoved = wasCat !== nowCat;
       const statusMoved = String(a.status || "") !== String(b.status || "");
+      const becamePayable = wasCat !== "payable" && nowCat === "payable";
+      const lostPayable = wasCat === "payable" && nowCat !== "payable";
       rows.push({
+        becamePayable, lostPayable,
         ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
         change: valueMoved && (catMoved || statusMoved) ? "value+status"
           : valueMoved ? "value"
@@ -2328,12 +2340,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     for (const [k, a] of snap) {
       if (live.has(k)) continue;
       rows.push({ ...a, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
-        change: "removed", was: a.gp, now: 0 });
+        change: "removed", was: a.gp, now: 0,
+        becamePayable: false, lostPayable: catOf(a) === "payable" });
     }
     return rows;
   }, [statics, ns, keys.join(), statusRules]);
 
   const [drill, setDrill] = useState(null);   // { agent, i }
+  const [drillFilter, setDrillFilter] = useState("all");   // all | gained | lost
 
   // manager filter
   const [mgr, setMgr] = useState("all");
@@ -2400,6 +2414,24 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       diff: { total: live.total - stat.total, payable: live.payable - stat.payable, waiting: live.waiting - stat.waiting },
     };
   }, [ns, statics, shownAgents, keys.join(), statusRules, idx]);
+
+  // "Now payable" / "No longer payable" per month, across the agents shown
+  const monthlyMoves = useMemo(() => {
+    const blank = keys.map(() => ({ gained: 0, lost: 0, nGained: 0, nLost: 0 }));
+    if (!Object.keys(statics).length) return null;
+    const allow = new Set(shownAgents.map(([n]) => n));
+    for (const [name] of shownAgents) {
+      keys.forEach((mk, i) => {
+        if (!statics[mk]) return;
+        const rows = changesFor(name, i) || [];
+        for (const r of rows) {
+          if (r.becamePayable) { blank[i].gained += r.now || 0; blank[i].nGained++; }
+          if (r.lostPayable) { blank[i].lost += r.was || 0; blank[i].nLost++; }
+        }
+      });
+    }
+    return blank;
+  }, [shownAgents, statics, keys.join(), changesFor]);
 
   const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
 
@@ -2503,24 +2535,50 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
           {breaches.length > 40 && <p className="note">Showing 40 of {breaches.length}.</p>}
         </div>
       )}
-      <div style={{ overflowX: "auto" }}>
+      <div style={{ overflowX: "auto" }} className="pay">
         <table>
           <thead>
             <tr>
-              <th className="left">Agent</th>
+              <th className="left agent">Agent</th>
               <th className="num">Payplan</th>
               {MONTHS_FY.map(([, l]) => <th key={l} className="num">{l}</th>)}
               <th className="num">Total</th>
             </tr>
           </thead>
           <tbody>
+            {monthlyMoves && (
+              <>
+                <tr className="moves">
+                  <td className="left agent">Now payable</td>
+                  <td className="num">-</td>
+                  {monthlyMoves.map((m, i) => (
+                    <td key={i} className="num mono" style={{ color: m.gained ? "#14804a" : undefined }}>
+                      {m.gained ? gbp0(m.gained) : "-"}
+                      {m.nGained > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nGained} order{m.nGained === 1 ? "" : "s"}</div>}
+                    </td>
+                  ))}
+                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.gained)))}</td>
+                </tr>
+                <tr className="moves">
+                  <td className="left agent">No longer payable</td>
+                  <td className="num">-</td>
+                  {monthlyMoves.map((m, i) => (
+                    <td key={i} className="num mono" style={{ color: m.lost ? "#b3261e" : undefined }}>
+                      {m.lost ? gbp0(m.lost) : "-"}
+                      {m.nLost > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nLost} order{m.nLost === 1 ? "" : "s"}</div>}
+                    </td>
+                  ))}
+                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.lost)))}</td>
+                </tr>
+              </>
+            )}
             {shownAgents.map(([name, g]) => {
               const vals = g[basis] || g.earned;
               return (
                 <tr key={name}>
-                  <td className="left">
+                  <td className="left agent">
                     {name}
-                    {managers[name] && <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{managers[name]}</div>}
+                    {managers[name] && <div className="sub" style={{ margin: 0, fontSize: 10 }}>{managers[name]}</div>}
                   </td>
                   <td className="num mono">{payplans[name] ?? dbPlans[name] ? gbp(Number(payplans[name] ?? dbPlans[name])) : "-"}</td>
                   {vals.map((v, i) => {
@@ -2579,8 +2637,11 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             Upload one under <strong>Settings → Monthly Reports</strong> to compare.
           </div>
         ) : (() => {
-          const moved = drillRows.filter((r) => r.change);
-          const rest = drillRows.filter((r) => !r.change);
+          const gained = drillRows.filter((r) => r.becamePayable);
+          const lost = drillRows.filter((r) => r.lostPayable);
+          const base = drillFilter === "gained" ? gained : drillFilter === "lost" ? lost : drillRows;
+          const moved = base.filter((r) => r.change);
+          const rest = drillFilter === "all" ? base.filter((r) => !r.change) : [];
           const hue = (r) => r.change === "removed" ? "#f7c8c2"
             : r.change === "value+status" ? "#fbd5cf"
               : r.change === "status" ? "#fde2dd"
@@ -2622,6 +2683,8 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
               <td className="num mono">
                 <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>was {r.was == null ? "-" : gbp0(r.was)}</div>
                 <div>now {gbp0(r.now)}</div>
+                {r.becamePayable && <div className="chip matched" style={{ fontSize: 9.5 }}>now payable</div>}
+                {r.lostPayable && <div className="chip risk" style={{ fontSize: 9.5 }}>lost payable</div>}
               </td>
               <td className={"num mono " + (((r.now || 0) - (r.was || 0)) === 0 ? "" : ((r.now || 0) - (r.was || 0)) > 0 ? "pos" : "neg")}>
                 {r.was == null ? "new" : (((r.now || 0) - (r.was || 0)) > 0 ? "+" : "") + gbp0((r.now || 0) - (r.was || 0))}
@@ -2664,8 +2727,16 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                   </table>
                 );
               })()}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                {[["all", `All changes (${drillRows.filter((r) => r.change).length})`],
+                  ["gained", `Now payable (${gained.length})`],
+                  ["lost", `No longer payable (${lost.length})`]].map(([v, l]) => (
+                  <button key={v} className={"tab " + (drillFilter === v ? "active" : "")}
+                    style={{ padding: "5px 11px", fontSize: 12 }} onClick={() => setDrillFilter(v)}>{l}</button>
+                ))}
+              </div>
               <p className="note" style={{ marginTop: 0 }}>
-                {moved.length} line{moved.length === 1 ? "" : "s"} moved since the {periodLabel(keys[drill.i])} snapshot.
+                {moved.length} line{moved.length === 1 ? "" : "s"} shown, compared with the {periodLabel(keys[drill.i])} snapshot.
               </p>
               <div style={{ overflowX: "auto" }}>
                 <table>
@@ -3280,6 +3351,20 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
   }, [statics, ns, cYear, statusRules]);
 
   // ---- exceptions needing action ----
+  // GP split by tone category, for the snapshot comparison
+  const catTotals = useMemo(() => {
+    let total = 0, payable = 0, issued = 0;
+    for (const r of recs) {
+      const gp = r.expected || 0;
+      const cat = statusCategory(statusRules, r.nsStatus);
+      if (cat === "red") continue;
+      total += gp;
+      if (cat === "payable") payable += gp;
+      if (cat === "issued") issued += gp;
+    }
+    return { total, payable, issued };
+  }, [recs, statusRules]);
+
   // ---- commission pay control ----
   const pay = useMemo(() => {
     const btPaidUs = sum(recs.map((r) => r.paid));
@@ -3290,11 +3375,11 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
   const changes = useMemo(() => {
     if (!snapshot) return null;
     return {
-      received: k.nsGp - (snapshot.received || 0),
-      entitled: pay.entitled - (snapshot.entitled || 0),
-      exceptions: k.nException - (snapshot.nException || 0),
+      total: catTotals.total - (snapshot.total ?? snapshot.received ?? 0),
+      payable: catTotals.payable - (snapshot.payable ?? 0),
+      issued: catTotals.issued - (snapshot.issued ?? 0),
     };
-  }, [snapshot, k, pay]);
+  }, [snapshot, catTotals]);
 
   const W = 640, H = 230, padL = 46, padB = 26, padT = 8;
   const bw = monthly.length ? (W - padL - 8) / monthly.length : 0;
@@ -3323,7 +3408,8 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
         </div>
         <button className="btn" style={{ background: "#1e64d6", color: "#fff", padding: "9px 14px" }}
           onClick={() => saveSnapshot({
-            at: new Date().toISOString(), received: k.nsGp, entitled: pay.entitled, nException: k.nException,
+            at: new Date().toISOString(), total: catTotals.total, payable: catTotals.payable,
+            issued: catTotals.issued, nException: k.nException,
           })}>
           {snapshot?.at ? `Re-lock snapshot (last ${new Date(snapshot.at).toLocaleDateString("en-GB")})` : "Lock snapshot"}
         </button>
@@ -3556,13 +3642,15 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
             ) : (
               <table>
                 <tbody>
-                  <tr><td className="left">Total GP from NetSuite</td>
-                    <td className={"num mono " + (changes.received >= 0 ? "pos" : "neg")}>{gbp0(changes.received)}</td></tr>
-                  <tr><td className="left">Agents entitled</td>
-                    <td className={"num mono " + (changes.entitled >= 0 ? "pos" : "neg")}>{gbp0(changes.entitled)}</td></tr>
-                  <tr><td className="left">Open exceptions</td>
-                    <td className={"num mono " + (changes.exceptions <= 0 ? "pos" : "neg")}>
-                      {changes.exceptions > 0 ? "+" : ""}{changes.exceptions}</td></tr>
+                  {[["Total GP Change", changes.total], ["Total Payable Change", changes.payable],
+                    ["Total Issued Change", changes.issued]].map(([l, v]) => (
+                    <tr key={l}>
+                      <td className="left">{l}</td>
+                      <td className={"num mono " + (v === 0 ? "" : v > 0 ? "pos" : "neg")}>
+                        {v > 0 ? "+" : ""}{gbp0(v)}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             )}
