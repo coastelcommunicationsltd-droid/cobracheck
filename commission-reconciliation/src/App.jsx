@@ -15,7 +15,7 @@ import { createClient } from "@supabase/supabase-js";
 // protection is the login + the email allow-list you set up in the SQL step.
 // The URL below is already your existing project; just paste the anon key.
 const SUPABASE_URL = "https://xrekebgnubhjqtpllbcz.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhyZWtlYmdudWJoanF0cGxsYmN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MDEyNDMsImV4cCI6MjEwMDk3NzI0M30.1MbG2AX63hFNvzZoZB56pjkOlW6Dq7s4U5mGaaJGi80";
+const SUPABASE_ANON_KEY = "PASTE-YOUR-ANON-KEY-HERE";
 // ==========================================================
 
 const supabase =
@@ -159,7 +159,7 @@ const KEEP_COLS = {
     "Product Group 2", "Product Group2", "Product Group", "Netsuite Ref"],
   cobra: ["Job Header", "Opty ID", "LE Code", "Customer Name", "Status", "Month",
     "Contract Value", "Commission Due", "Commission Paid", "Measure", "Plan Name",
-    "Prod Code", "Closed Date", "Order Date"],
+    "Prod Code", "Closed Date", "Order Date", "Month", "FY"],
   sch5: ["MAIN ORDER NUM", "ADT REF", "OPPORTUNITY ID", "LE CODE", "CUSTOMER NAME",
     "ORDER STATUS", "ORDER SUB STATUS", "CANCEL DATE", "SOV", "COMMISSION FLAG",
     "PRODUCT SUB NAME1", "TRANSACTIONAL", "RECENT CANCELLATION", "CLOSED DATE",
@@ -223,8 +223,24 @@ const cobraRow = (r) => ({
   product: firstDefined(pick(r, ["Measure", "Plan Name"])),
   prodCode: firstDefined(pick(r, ["Prod Code"])),
   date: pick(r, ["Closed Date", "Order Date"]),
+  cobraMonth: firstDefined(pick(r, ["Month"])),
+  cobraFy: firstDefined(pick(r, ["FY"])),
   raw: r,
 });
+
+// Cobra ships its own commission-run month + financial year (e.g. Month "Apr", FY "FY2026").
+// FY2026 runs Apr 2026 -> Mar 2027, so months Jan-Mar belong to the following calendar year.
+const MONTH_ABBR = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const cobraPeriod = (r) => {
+  const mi = MONTH_ABBR.indexOf(String(r.cobraMonth || "").trim().slice(0, 3).toLowerCase());
+  const fy = String(r.cobraFy || "").match(/(\d{4})/);
+  if (mi >= 0 && fy) {
+    const startYear = Number(fy[1]);
+    const year = mi >= 3 ? startYear : startYear + 1; // Apr(3)..Dec stay, Jan-Mar roll over
+    return `${year}-${String(mi + 1).padStart(2, "0")}`;
+  }
+  return monthKey(r.date);
+};
 
 const sch5Row = (r) => ({
   src: "sch5",
@@ -341,7 +357,7 @@ function reconcile(files, tol, period = "all") {
       expected, recordedCobra, due, paid, nsSov, s5Sov, cobraSov,
       payDelta, recordDelta, dueVsPaid, sovDelta,
       sch5Cancelled, sch5NonComm, anyUnpaid, overpaymentFlag,
-      period: monthKey(nsL[0]?.date) || monthKey(cbL[0]?.date) || monthKey(s5L[0]?.date) || null,
+      period: monthKey(nsL[0]?.date) || (cbL[0] ? cobraPeriod(cbL[0]) : null) || monthKey(s5L[0]?.date) || null,
       product: firstDefined(nsL[0]?.product, cbL[0]?.product, s5L[0]?.product),
       productGroup: productGroupOf(firstDefined(...nsL.map((x) => x.product))),
       netsuiteRef: firstDefined(...nsL.map((x) => x.netsuiteRef)),
@@ -452,10 +468,11 @@ label.file.reload { background:#efeaff; color:#5514b4; }
 .kpi .val.mono { font-size:22px; }
 .kpi .foot { font-size:12px; color:#7a7690; margin-top:2px; }
 table { width:100%; border-collapse:collapse; font-size:13px; }
-th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:#8a8aa3;
+th { text-align:center; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:#8a8aa3;
   border-bottom:1px solid #eceaf4; padding:8px 10px; position:sticky; top:0; background:#fff; }
 th.num { text-align:center; }
-td { padding:9px 10px; border-bottom:1px solid #f1f0f8; vertical-align:top; }
+td { padding:9px 10px; border-bottom:1px solid #f1f0f8; vertical-align:middle; text-align:center; }
+td.left, th.left { text-align:left; }
 tr.click { cursor:pointer; }
 tr.click:hover { background:#faf9ff; }
 .chip { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:20px; }
@@ -528,6 +545,33 @@ export default function ReconciliationTool() {
   const [users, setUsers] = useState([]);
   const [newUser, setNewUser] = useState({ email: "", password: "" });
   const [userMsg, setUserMsg] = useState(null);
+  // shared settings: risk levels per order status, agent payplans, paid marks, WIP manual rows.
+  // Stored as a second row (id='settings') in the SAME table — no database change needed.
+  const [settings, setSettings] = useState({ risk: {}, payplans: {}, paidMarks: {}, wip: {} });
+  const [settingsSaving, setSettingsSaving] = useState(false);
+
+  useEffect(() => {
+    if (!supabase || !session) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("recon_datasets").select("cobra").eq("id", "settings").maybeSingle();
+      if (!cancelled && data && data.cobra) {
+        setSettings((s) => ({ ...s, ...data.cobra }));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [session]);
+
+  const saveSettings = useCallback(async (next) => {
+    setSettings(next);
+    if (!supabase || !session) return;
+    setSettingsSaving(true);
+    await supabase.from("recon_datasets").upsert(
+      { id: "settings", cobra: next, uploaded_by: session.user?.email || null, uploaded_at: new Date().toISOString() },
+      { onConflict: "id" }
+    );
+    setSettingsSaving(false);
+  }, [session]);
 
   // track the logged-in session
   useEffect(() => {
@@ -729,12 +773,13 @@ export default function ReconciliationTool() {
 
   const TABS = [
     ["cross", "Cross-Reference"],
+    ["wip", "WIP Tracker"],
+    ["agents", "Payments Per Agent"],
     ["btpay", "BT Payment Check"],
     ["exceptions", "Exceptions & Risk"],
     ["obi", "OBI Checks"],
     ["reconcile", "Reconciliation"],
-    ["rawdata", "Raw Data"],
-    ...(isAdmin ? [["users", "Users"]] : []),
+    ["settings", "Settings"],
   ];
 
   return (
@@ -814,18 +859,28 @@ export default function ReconciliationTool() {
           ))}
         </div>
 
-        {tab === "rawdata" && (
-          <RawData files={files} errors={errors} onFile={onFile} supabase={supabase}
-            session={session} saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} />
+        {tab === "settings" && (
+          <Settings
+            files={files} errors={errors} onFile={onFile} supabase={supabase} session={session}
+            saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded}
+            isAdmin={isAdmin} users={users} newUser={newUser} setNewUser={setNewUser}
+            addUser={addUser} removeUser={removeUser} userMsg={userMsg}
+            settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
+            records={result.records}
+          />
         )}
 
-        {tab !== "rawdata" && tab !== "users" && !anyLoaded && (
-          <div className="empty panel">No data loaded yet. Open the <strong>Raw Data</strong> tab to upload the three exports.</div>
+        {tab !== "settings" && !anyLoaded && (
+          <div className="empty panel">No data loaded yet. Open <strong>Settings → Raw Data</strong> to upload the three exports.</div>
         )}
 
-        {tab !== "rawdata" && (anyLoaded || tab === "users") && (
+        {tab !== "settings" && anyLoaded && (
           <>
-            {tab === "cross" && <CrossReference records={result.records} />}
+            {tab === "cross" && <CrossReference records={result.records} settings={settings} />}
+
+            {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
+
+            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -848,7 +903,7 @@ export default function ReconciliationTool() {
                           <Fragment key={r.key}>
                             <tr className="click" onClick={() => toggle(r.key)}>
                               <td className="mono">{r.orderNum || "—"}</td>
-                              <td>{r.company}</td>
+                              <td className="left">{r.company}</td>
                               <td><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
                               <td className="num mono">{gbp(r.expected)}</td>
                               <td className="num mono">{gbp(r.paid)}</td>
@@ -892,8 +947,8 @@ export default function ReconciliationTool() {
                     <tbody>
                       {result.records.filter((r) => r.inCobra).map((r) => (
                         <tr key={r.key}>
-                          <td className="mono">{r.orderNum}</td>
-                          <td>{r.company}</td>
+                          <td className="left mono">{r.orderNum}</td>
+                          <td className="left">{r.company}</td>
                           <td className="num mono">{gbp(r.due)}</td>
                           <td className="num mono">{gbp(r.paid)}</td>
                           <td><Delta v={r.dueVsPaid} /></td>
@@ -953,44 +1008,6 @@ export default function ReconciliationTool() {
                 ) : (
                   <ObiChecks records={result.records} />
                 )}
-              </div>
-            )}
-            {tab === "users" && isAdmin && (
-              <div className="panel">
-                <h2>Users — who can sign in</h2>
-                <div className="banner info">
-                  Add a person's email and a password here, then hand them those two things — that's how they sign in.
-                  Only people in this list can see the data.
-                </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
-                  <input type="email" placeholder="Email" value={newUser.email}
-                    onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
-                    style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 220 }} />
-                  <input type="text" placeholder="Password (min 6 chars)" value={newUser.password}
-                    onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
-                    style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 200 }} />
-                  <button className="btn" style={{ background: "#5514b4", color: "#fff" }} onClick={addUser}>Add login</button>
-                </div>
-                {userMsg && (
-                  <p className="sub" style={{ color: userMsg.err ? "#b3261e" : "#14804a", marginTop: 0 }}>{userMsg.text}</p>
-                )}
-                <table>
-                  <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
-                  <tbody>
-                    {users.map((u) => (
-                      <tr key={u.email}>
-                        <td className="mono">{u.email}</td>
-                        <td>{u.is_admin ? <span className="chip matched">admin</span> : <span className="chip unmatched">viewer</span>}</td>
-                        <td className="num">
-                          {(u.email || "").toLowerCase() !== (session?.user?.email || "").toLowerCase() && (
-                            <button className="btn" onClick={() => removeUser(u.email)}>Remove</button>
-                          )}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                <p className="note">Removing someone stops them seeing the data. Their password reset (if ever needed) is done from Supabase.</p>
               </div>
             )}
           </>
@@ -1229,7 +1246,8 @@ function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta,
 }
 
 // ---------- Cross-Reference tab: order ref across all three sheets ----------
-function CrossReference({ records }) {
+function CrossReference({ records, settings }) {
+  const riskOf = (r) => (settings?.risk || {})[String(r.nsStatus || "").trim()] || "";
   const [group, setGroup] = useState("all");
   const [sheets, setSheets] = useState("all");
   const [paidView, setPaidView] = useState("show");
@@ -1248,6 +1266,7 @@ function CrossReference({ records }) {
     onAll: r.inNS && r.inCobra && r.inSch5,
     paid: r.paid,
     paidFlag: isPaid(r),
+    risk: riskOf(r),
   }));
 
   const groups = [...new Set(enriched.map((r) => r.productGroup).filter(Boolean))].sort();
@@ -1282,6 +1301,7 @@ function CrossReference({ records }) {
       case "item": return (r.product || "").toLowerCase();
       case "group": return (r.productGroup || "").toLowerCase();
       case "status": return (r.nsStatus || "").toLowerCase();
+      case "risk": return ["high","medium","low","none",""].indexOf(r.risk || "");
       case "sheets": return r.sheetCode;
       case "nsSov": return r.inNS ? r.nsSov : null;
       case "s5Sov": return r.inSch5 ? r.s5Sov : null;
@@ -1321,22 +1341,22 @@ function CrossReference({ records }) {
 
   const click = (col) =>
     setSort((s) => ({ col, dir: s.col === col ? (s.dir === "asc" ? "desc" : "asc") : (["order", "nsref", "company", "item", "group", "status", "sheets"].includes(col) ? "asc" : "desc") }));
-  const H = ({ col, label, num }) => (
-    <th className={num ? "num" : ""} style={{ cursor: "pointer", userSelect: "none" }} onClick={() => click(col)}>
-      {label}{sort.col === col ? (sort.dir === "asc" ? " \u25B2" : " \u25BC") : ""}
+  const H = ({ col, label, num, left }) => (
+    <th className={left ? "left" : "num"} style={{ cursor: "pointer", userSelect: "none" }} onClick={() => click(col)}>
+      {label}{sort.col === col ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
     </th>
   );
 
   return (
     <>
       <div className="panel">
-        <h2>Totals \u2014 SOV &amp; GP across the three sheets</h2>
+        <h2>Totals — SOV &amp; GP across the three sheets</h2>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead>
               <tr>
                 <th>Metric</th><th className="num">NetSuite</th><th className="num">Sch5</th><th className="num">Cobra</th>
-                <th className="num">Cobra \u2212 NS</th><th className="num">Sch5 \u2212 NS</th>
+                <th className="num">Cobra − NS</th><th className="num">Sch5 − NS</th>
               </tr>
             </thead>
             <tbody>
@@ -1351,10 +1371,10 @@ function CrossReference({ records }) {
               <tr>
                 <td><strong>GP</strong> <span className="sub">(Product GP / Commission Paid)</span></td>
                 <td className="num mono">{gbp(T.nsGp)}</td>
-                <td className="num mono">\u2014</td>
+                <td className="num mono">-</td>
                 <td className="num mono">{gbp(T.cbGp)}</td>
                 <td>{diffCell(T.cbGp - T.nsGp)}</td>
-                <td className="num mono">\u2014</td>
+                <td className="num mono">-</td>
               </tr>
             </tbody>
           </table>
@@ -1363,7 +1383,16 @@ function CrossReference({ records }) {
       </div>
 
       <div className="panel">
-        <h2 style={{ marginBottom: 10 }}>By order reference</h2>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h2 style={{ margin: 0, marginBottom: 10 }}>By order reference</h2>
+          <button className="btn" onClick={() => downloadCSV(rows.map((r) => ({
+            "Order ref": r.orderNum, "NetSuite ref": r.netsuiteRef || "", Company: r.company,
+            "Item name": r.product || "", Product: r.productGroup || "", "Order status": r.nsStatus || "",
+            Risk: r.risk || "", "On NetSuite": r.inNS ? "Y" : "", "On Cobra": r.inCobra ? "Y" : "", "On Sch5": r.inSch5 ? "Y" : "",
+            "NS SOV": r.inNS ? r.nsSov : "", "Sch5 SOV": r.inSch5 ? r.s5Sov : "", "Cobra SOV": r.inCobra ? r.cobraSov : "",
+            "SOV diff": r.sovSpread, "NS GP": r.inNS ? r.expected : "", "Cobra GP": r.inCobra ? r.paid : "", "GP diff": r.gpDiff,
+          })), "cross-reference.csv")}>Export CSV</button>
+        </div>
         <div className="settings" style={{ marginBottom: 12 }}>
           <span>Product:</span>
           <select value={group} onChange={(e) => setGroup(e.target.value)} style={selStyle}>
@@ -1394,19 +1423,20 @@ function CrossReference({ records }) {
           <span style={{ color: "#8a8aa3" }}>{filtered.length} of {enriched.length} references</span>
         </div>
         <p className="note" style={{ marginTop: 0 }}>
-          Joined on order reference \u2014 <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
+          Joined on order reference — <span className="mono">Order ref</span> (NetSuite) = <span className="mono">MAIN ORDER NUM</span> (Sch5) = <span className="mono">Job Header</span> (Cobra).
           Click any column heading to sort.
         </p>
         <div style={{ overflowX: "auto" }}>
           <table>
             <thead>
               <tr>
-                <H col="order" label="Order ref" />
-                <H col="nsref" label="NetSuite ref" />
-                <H col="company" label="Company" />
-                <H col="item" label="Item name" />
-                <H col="group" label="Product" />
+                <H col="order" label="Order ref" left />
+                <H col="nsref" label="NetSuite ref" left />
+                <H col="company" label="Company" left />
+                <H col="item" label="Item name" left />
+                <H col="group" label="Product" left />
                 <H col="status" label="Order status" />
+                <H col="risk" label="Risk" num />
                 <H col="sheets" label="Sheets" num />
                 <H col="nsSov" label="NS SOV" num />
                 <H col="s5Sov" label="Sch5 SOV" num />
@@ -1420,19 +1450,20 @@ function CrossReference({ records }) {
             <tbody>
               {shown.map((r) => (
                 <tr key={r.key}>
-                  <td className="mono">{r.orderNum}</td>
-                  <td className="mono">{r.netsuiteRef || "\u2014"}</td>
-                  <td>{r.company}</td>
-                  <td>{r.product || "\u2014"}</td>
-                  <td>{r.productGroup || "\u2014"}</td>
-                  <td>{r.nsStatus || "\u2014"}</td>
+                  <td className="left mono">{r.orderNum}</td>
+                  <td className="left mono">{r.netsuiteRef || "-"}</td>
+                  <td className="left">{r.company}</td>
+                  <td className="left">{r.product || "-"}</td>
+                  <td className="left">{r.productGroup || "-"}</td>
+                  <td>{r.nsStatus || "-"}</td>
+                  <td className="num">{riskChip(r.risk) || "-"}</td>
                   <td className="num"><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
-                  <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">\u2014</span>}</td>
-                  <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">\u2014</span>}</td>
-                  <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">\u2014</span>}</td>
+                  <td>{r.inNS ? cell(r.nsSov) : <span className="num sub">-</span>}</td>
+                  <td>{r.inSch5 ? cell(r.s5Sov) : <span className="num sub">-</span>}</td>
+                  <td>{r.inCobra ? cell(r.cobraSov) : <span className="num sub">-</span>}</td>
                   <td>{diffCell(r.sovSpread)}</td>
-                  <td>{r.inNS ? cell(r.expected) : <span className="num sub">\u2014</span>}</td>
-                  <td>{r.inCobra ? cell(r.paid) : <span className="num sub">\u2014</span>}</td>
+                  <td>{r.inNS ? cell(r.expected) : <span className="num sub">-</span>}</td>
+                  <td>{r.inCobra ? cell(r.paid) : <span className="num sub">-</span>}</td>
                   <td>{diffCell(r.gpDiff)}</td>
                 </tr>
               ))}
@@ -1442,6 +1473,503 @@ function CrossReference({ records }) {
         {rows.length > 1000 && <p className="note">Showing 1,000 of {rows.length} references. Narrow with the filters or the month selector.</p>}
         {rows.length === 0 && <div className="empty">Nothing matches these filters.</div>}
       </div>
+    </>
+  );
+}
+
+// =========================================================================
+//  Shared helpers for the month-based tabs
+// =========================================================================
+const MONTHS_FY = [
+  ["04", "Apr"], ["05", "May"], ["06", "June"], ["07", "July"], ["08", "Aug"], ["09", "Sept"],
+  ["10", "Oct"], ["11", "Nov"], ["12", "Dec"], ["01", "Jan"], ["02", "Feb"], ["03", "March"],
+];
+// financial year starting April: monthKey "2025-06" -> 2025 ; "2026-02" -> 2025
+const fyStartOf = (key) => {
+  if (!key) return null;
+  const [y, m] = key.split("-").map(Number);
+  return m >= 4 ? y : y - 1;
+};
+const fyLabel = (start) => `${start}>${start + 1}`;
+// the 12 monthKeys of a financial year, in Apr..Mar order
+const fyMonthKeys = (start) =>
+  MONTHS_FY.map(([mm]) => `${Number(mm) >= 4 ? start : start + 1}-${mm}`);
+
+const pct = (n, d) => (!d ? null : (n / d) * 100);
+const fmtPct = (v) => (v == null ? "-" : v.toFixed(2) + "%");
+
+// pull NetSuite + Cobra lines out of the loaded files (unfiltered by the month selector)
+function useSourceLines(files) {
+  return useMemo(() => {
+    const ns = (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date) }));
+    const cb = (files.cobra?.rows || []).map(cobraRow).map((r) => ({ ...r, period: cobraPeriod(r) }));
+    return { ns, cb };
+  }, [files]);
+}
+
+// =========================================================================
+//  WIP Tracker — replica of the monthly GP/WIP sheet
+// =========================================================================
+function WipTracker({ files, settings, saveSettings, settingsSaving }) {
+  const { ns, cb } = useSourceLines(files);
+
+  const years = useMemo(() => {
+    const s = new Set();
+    ns.forEach((r) => { const f = fyStartOf(r.period); if (f) s.add(f); });
+    cb.forEach((r) => { const f = fyStartOf(r.period); if (f) s.add(f); });
+    return [...s].sort((a, b) => b - a);
+  }, [ns, cb]);
+
+  const [fy, setFy] = useState(null);
+  const year = fy ?? years[0] ?? null;
+  const keys = year != null ? fyMonthKeys(year) : [];
+
+  // ---- figures that come straight from the reports ----
+  const rep = useMemo(() => {
+    const z = () => keys.map(() => 0);
+    const latestStats = z(), paidCobra = z(), unpaidWip = z(), accOwed = z(), accPaid = z();
+    const idx = new Map(keys.map((k, i) => [k, i]));
+    for (const r of ns) {
+      const i = idx.get(r.period);
+      if (i == null) continue;
+      const gp = r.expected || 0;
+      latestStats[i] += gp;
+      if (r.itemPaid != null && !isYes(r.itemPaid)) unpaidWip[i] += gp;
+      if (isYes(r.accelerator)) { accOwed[i] += gp; accPaid[i] += r.recordedCobra || 0; }
+    }
+    for (const r of cb) {
+      const i = idx.get(r.period);
+      if (i == null) continue;
+      paidCobra[i] += r.paid || 0;
+    }
+    return { latestStats, paidCobra, unpaidWip, accOwed, accPaid };
+  }, [ns, cb, keys.join()]);
+
+  // ---- manual rows, stored in shared settings ----
+  const wipAll = settings.wip || {};
+  const manual = (wipAll[year] || {});
+  const getM = (rowKey, i) => {
+    const v = manual[rowKey]?.[i];
+    return v == null || v === "" ? null : Number(v);
+  };
+  const setM = (rowKey, i, val) => {
+    const next = JSON.parse(JSON.stringify(settings.wip || {}));
+    next[year] = next[year] || {};
+    next[year][rowKey] = next[year][rowKey] || [];
+    next[year][rowKey][i] = val === "" ? null : Number(val);
+    saveSettings({ ...settings, wip: next });
+  };
+
+  const rowVals = (rowKey) => keys.map((_, i) => getM(rowKey, i));
+  const netOrig = rowVals("netOriginal");
+  const origPayroll = rowVals("originalPayroll");
+  const latestPayroll = rowVals("latestPayroll");
+  const pillar = rowVals("pillar");
+  const accUplift = rowVals("accUplift");
+
+  // ---- formulas ----
+  const netVsLatest = keys.map((_, i) => (netOrig[i] == null ? null : netOrig[i] - rep.latestStats[i]));
+  const changeToPayroll = keys.map((_, i) => pct(latestPayroll[i], netOrig[i]));
+  const changeInValue = keys.map((_, i) => (netOrig[i] == null || latestPayroll[i] == null ? null : netOrig[i] - latestPayroll[i]));
+  const cancelled = keys.map((_, i) => (netOrig[i] ? pct(netVsLatest[i], netOrig[i]) : null));
+  const paidPct = keys.map((_, i) => pct(rep.paidCobra[i], rep.latestStats[i]));
+  const overage = keys.map((_, i) => rep.paidCobra[i] - rep.latestStats[i]);
+
+  const tot = (arr) => sum(arr.filter((v) => v != null));
+  const cellNum = (v) => (v == null ? "-" : gbp(v));
+
+  const Row = ({ label, tag, vals, kind, rowKey, danger }) => (
+    <tr>
+      <td className="left" style={{ whiteSpace: "nowrap" }}>
+        <span className={"chip " + (tag === "Formula" ? "mismatch" : tag === "Report" ? "matched" : "unmatched")}
+          style={{ marginRight: 8, fontSize: 10 }}>{tag}</span>
+        <strong>{label}</strong>
+      </td>
+      {vals.map((v, i) => (
+        <td key={i} className="num mono" style={{
+          background: danger && v != null && danger(v) ? "#fbe9e7" : undefined,
+          color: danger && v != null && danger(v) ? "#b3261e" : undefined,
+        }}>
+          {kind === "input" ? (
+            <input type="number" value={manual[rowKey]?.[i] ?? ""} placeholder="-"
+              onChange={(e) => setM(rowKey, i, e.target.value)}
+              style={{ width: 82, padding: "4px 6px", border: "1px solid #e2e0ee", borderRadius: 5,
+                fontSize: 12, textAlign: "center", background: "#faf9ff" }} />
+          ) : kind === "pct" ? fmtPct(v) : cellNum(v)}
+        </td>
+      ))}
+      <td className="num mono"><strong>{kind === "pct" ? "-" : gbp(tot(vals))}</strong></td>
+    </tr>
+  );
+
+  // unpaid WIP split by product group, for the summary strip
+  const wipByProduct = useMemo(() => {
+    const m = new Map();
+    for (const r of ns) {
+      if (fyStartOf(r.period) !== year) continue;
+      if (r.itemPaid == null || isYes(r.itemPaid)) continue;
+      const g = productGroupOf(r.product) || "Other";
+      m.set(g, (m.get(g) || 0) + (r.expected || 0));
+    }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+  }, [ns, year]);
+
+  if (year == null) return <div className="empty panel">No dated rows found in the loaded files.</div>;
+
+  return (
+    <>
+      <div className="panel">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <h2 style={{ margin: 0 }}>Outstanding unpaid WIP — {fyLabel(year)}</h2>
+          <div className="settings">
+            <span>Financial year:</span>
+            <select value={year} onChange={(e) => setFy(Number(e.target.value))}
+              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+              {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+            </select>
+            {settingsSaving && <span className="sub" style={{ margin: 0 }}>Saving…</span>}
+          </div>
+        </div>
+        <div style={{ overflowX: "auto", marginTop: 12 }}>
+          <table>
+            <thead><tr>
+              {wipByProduct.map(([g]) => <th key={g} className="num">{g}</th>)}
+              <th className="num">Total outstanding</th>
+            </tr></thead>
+            <tbody><tr>
+              {wipByProduct.map(([g, v]) => <td key={g} className="num mono">{gbp(v)}</td>)}
+              <td className="num mono"><strong>{gbp(sum(wipByProduct.map((x) => x[1])))}</strong></td>
+            </tr></tbody>
+          </table>
+        </div>
+        <p className="note">Unpaid WIP = NetSuite GP where Item Paid is not "Yes", grouped by product.</p>
+      </div>
+
+      <div className="panel">
+        <h2>{fyLabel(year)} — monthly GP tracker</h2>
+        <p className="note" style={{ marginTop: 0 }}>
+          <span className="chip unmatched" style={{ fontSize: 10 }}>Manual</span> you type ·
+          <span className="chip matched" style={{ fontSize: 10, marginLeft: 6 }}>Report</span> from NetSuite/Cobra ·
+          <span className="chip mismatch" style={{ fontSize: 10, marginLeft: 6 }}>Formula</span> worked out.
+          Manual figures are shared with everyone signed in.
+        </p>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead>
+              <tr>
+                <th className="left">{fyLabel(year)}</th>
+                {MONTHS_FY.map(([, l]) => <th key={l} className="num">{l}</th>)}
+                <th className="num">Totals</th>
+              </tr>
+            </thead>
+            <tbody>
+              <Row label="Net Original stats GP" tag="Manual" kind="input" rowKey="netOriginal" vals={netOrig} />
+              <Row label="Original Payroll stats GP" tag="Manual" kind="input" rowKey="originalPayroll" vals={origPayroll} />
+              <Row label="Latest Payroll GP" tag="Manual" kind="input" rowKey="latestPayroll" vals={latestPayroll} />
+              <Row label="Net Vs Latest Diff" tag="Formula" vals={netVsLatest} danger={(v) => v > 0} />
+              <Row label="Latest stats" tag="Report" vals={rep.latestStats} />
+              <Row label="Latest Paid on Cobra" tag="Report" vals={rep.paidCobra} />
+              <Row label="O/S unpaid WIP" tag="Report" vals={rep.unpaidWip} />
+              <Row label="Pillar Bonus & Incentives" tag="Manual" kind="input" rowKey="pillar" vals={pillar} />
+              <Row label="Accelerator Uplift" tag="Manual" kind="input" rowKey="accUplift" vals={accUplift} />
+              <Row label="Change From Original to Payroll" tag="Formula" kind="pct" vals={changeToPayroll} />
+              <Row label="Change in Value" tag="Formula" vals={changeInValue} />
+              <Row label="How Much Cancelled?" tag="Formula" kind="pct" vals={cancelled} danger={(v) => v >= 20} />
+              <Row label="How much has been paid?" tag="Formula" kind="pct" vals={paidPct} />
+              <Row label="Accelerator Owed" tag="Report" vals={rep.accOwed} />
+              <Row label="Accelerator Paid" tag="Report" vals={rep.accPaid} />
+              <Row label="Overage" tag="Formula" vals={overage} />
+            </tbody>
+          </table>
+        </div>
+        <p className="note">
+          Net Vs Latest Diff = Net Original − Latest stats · Change in Value = Net Original − Latest Payroll ·
+          How Much Cancelled = Net Vs Latest Diff ÷ Net Original · How much has been paid = Paid on Cobra ÷ Latest stats ·
+          Overage = Paid on Cobra − Latest stats.
+        </p>
+      </div>
+    </>
+  );
+}
+
+// =========================================================================
+//  Payments Per Agent
+// =========================================================================
+function AgentPayments({ files, settings, saveSettings }) {
+  const { ns, cb } = useSourceLines(files);
+  const [basis, setBasis] = useState("earned");
+
+  const years = useMemo(() => {
+    const s = new Set();
+    ns.forEach((r) => { const f = fyStartOf(r.period); if (f) s.add(f); });
+    return [...s].sort((a, b) => b - a);
+  }, [ns]);
+  const [fy, setFy] = useState(null);
+  const year = fy ?? years[0] ?? null;
+  const keys = year != null ? fyMonthKeys(year) : [];
+  const idx = useMemo(() => new Map(keys.map((k, i) => [k, i])), [keys.join()]);
+
+  // Cobra paid, keyed by order ref, so we can attribute payments to the NetSuite agent
+  const paidByOrder = useMemo(() => {
+    const m = new Map();
+    for (const r of cb) m.set(r.orderNum, (m.get(r.orderNum) || 0) + (r.paid || 0));
+    return m;
+  }, [cb]);
+
+  const agents = useMemo(() => {
+    const m = new Map();
+    for (const r of ns) {
+      const i = idx.get(r.period);
+      if (i == null) continue;
+      const name = r.agent || "(unassigned)";
+      if (!m.has(name)) m.set(name, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
+      const g = m.get(name);
+      g.earned[i] += r.expected || 0;
+      g.paid[i] += paidByOrder.get(r.orderNum) || 0;
+    }
+    return [...m.entries()].sort((a, b) => sum(b[1].earned) - sum(a[1].earned));
+  }, [ns, idx, paidByOrder, keys.join()]);
+
+  const payplans = settings.payplans || {};
+  const paidMarks = settings.paidMarks || {};
+  const markKey = (agent, i) => `${year}|${agent}|${i}`;
+  const isMarkedPaid = (agent, i) => !!paidMarks[markKey(agent, i)];
+  const togglePaid = (agent, i) => {
+    const next = { ...paidMarks };
+    const k = markKey(agent, i);
+    if (next[k]) delete next[k]; else next[k] = true;
+    saveSettings({ ...settings, paidMarks: next });
+  };
+
+  const below = (agent, v) => {
+    const plan = Number(payplans[agent]);
+    return plan > 0 && v < plan;
+  };
+
+  if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
+
+  return (
+    <div className="panel">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+        <h2 style={{ margin: 0 }}>Payments per agent — {fyLabel(year)}</h2>
+        <div className="settings">
+          <span>Financial year:</span>
+          <select value={year} onChange={(e) => setFy(Number(e.target.value))}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+          </select>
+          <span style={{ width: 12 }} />
+          <span>Show:</span>
+          <select value={basis} onChange={(e) => setBasis(e.target.value)}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            <option value="earned">Commission earned (NetSuite GP)</option>
+            <option value="paid">Commission paid (Cobra)</option>
+          </select>
+        </div>
+      </div>
+      <p className="note" style={{ marginTop: 6 }}>
+        Red = below that agent's payplan for the month (set payplans in Settings). Tick a cell to mark the agent paid for that month.
+      </p>
+      <div style={{ overflowX: "auto" }}>
+        <table>
+          <thead>
+            <tr>
+              <th className="left">Agent</th>
+              <th className="num">Payplan</th>
+              {MONTHS_FY.map(([, l]) => <th key={l} className="num">{l}</th>)}
+              <th className="num">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {agents.map(([name, g]) => {
+              const vals = basis === "earned" ? g.earned : g.paid;
+              return (
+                <tr key={name}>
+                  <td className="left">{name}</td>
+                  <td className="num mono">{payplans[name] ? gbp(Number(payplans[name])) : "-"}</td>
+                  {vals.map((v, i) => {
+                    const bad = below(name, v);
+                    const marked = isMarkedPaid(name, i);
+                    return (
+                      <td key={i} className="num mono"
+                        style={{ background: bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
+                          color: bad ? "#b3261e" : undefined }}>
+                        <div>{v ? gbp(v) : "-"}</div>
+                        <label style={{ fontSize: 10, color: "#8a8aa3", cursor: "pointer", display: "inline-flex", gap: 3, alignItems: "center" }}>
+                          <input type="checkbox" checked={marked} onChange={() => togglePaid(name, i)} style={{ margin: 0 }} />
+                          paid
+                        </label>
+                      </td>
+                    );
+                  })}
+                  <td className="num mono"><strong>{gbp(sum(vals))}</strong></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {agents.length === 0 && <div className="empty">No agents found for this year.</div>}
+    </div>
+  );
+}
+
+// =========================================================================
+//  Settings — Risk Levels · Payplans · Raw Data · Users
+// =========================================================================
+const RISK_LEVELS = [
+  ["", "Not set"],
+  ["none", "No risk"],
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"],
+];
+const riskChip = (lvl) => {
+  if (!lvl || lvl === "none") return null;
+  const cls = lvl === "high" ? "risk" : lvl === "medium" ? "mismatch" : "unmatched";
+  return <span className={"chip " + cls}>{lvl}</span>;
+};
+
+function Settings(props) {
+  const { files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded,
+    isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
+    settings, saveSettings, settingsSaving, records } = props;
+  const [sub, setSub] = useState("risk");
+
+  const SUBS = [
+    ["risk", "Risk Levels"],
+    ["payplans", "Payplans"],
+    ["rawdata", "Raw Data"],
+    ...(isAdmin ? [["users", "Users"]] : []),
+  ];
+
+  // every order status seen in the loaded data
+  const statuses = useMemo(() => {
+    const s = new Set();
+    records.forEach((r) => { if (r.nsStatus) s.add(String(r.nsStatus).trim()); });
+    return [...s].sort();
+  }, [records]);
+
+  const agentNames = useMemo(() => {
+    const s = new Set();
+    records.forEach((r) => { if (r.agent) s.add(r.agent); });
+    return [...s].sort();
+  }, [records]);
+
+  const risk = settings.risk || {};
+  const payplans = settings.payplans || {};
+
+  return (
+    <>
+      <div className="tabs" style={{ marginBottom: 14 }}>
+        {SUBS.map(([k, l]) => (
+          <button key={k} className={"tab " + (sub === k ? "active" : "")} onClick={() => setSub(k)}>{l}</button>
+        ))}
+        {settingsSaving && <span className="sub" style={{ alignSelf: "center", marginLeft: 8 }}>Saving…</span>}
+      </div>
+
+      {sub === "risk" && (
+        <div className="panel">
+          <h2>Risk level per order status</h2>
+          <p className="note" style={{ marginTop: 0 }}>
+            Set how risky each NetSuite order status is. These show as a Risk column on the Cross-Reference tab
+            and are shared with everyone signed in.
+          </p>
+          {statuses.length === 0 ? (
+            <div className="empty">No order statuses found — load the NetSuite export first.</div>
+          ) : (
+            <table>
+              <thead><tr><th className="left">Order status</th><th className="num">Orders</th><th className="num">Risk level</th></tr></thead>
+              <tbody>
+                {statuses.map((st) => (
+                  <tr key={st}>
+                    <td className="left">{st}</td>
+                    <td className="num mono">{records.filter((r) => String(r.nsStatus || "").trim() === st).length}</td>
+                    <td className="num">
+                      <select value={risk[st] || ""}
+                        onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st]: e.target.value } })}
+                        style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+                        {RISK_LEVELS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {sub === "payplans" && (
+        <div className="panel">
+          <h2>Agent payplans</h2>
+          <p className="note" style={{ marginTop: 0 }}>
+            The monthly commission each agent is expected to hit. On the Payments Per Agent tab, any month
+            below this figure is flagged red.
+          </p>
+          {agentNames.length === 0 ? (
+            <div className="empty">No agents found — load the NetSuite export first.</div>
+          ) : (
+            <table>
+              <thead><tr><th className="left">Agent</th><th className="num">Monthly payplan (£)</th></tr></thead>
+              <tbody>
+                {agentNames.map((a) => (
+                  <tr key={a}>
+                    <td className="left">{a}</td>
+                    <td className="num">
+                      <input type="number" value={payplans[a] ?? ""} placeholder="-"
+                        onChange={(e) => saveSettings({ ...settings, payplans: { ...payplans, [a]: e.target.value === "" ? "" : Number(e.target.value) } })}
+                        style={{ width: 120, padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13, textAlign: "center" }} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {sub === "rawdata" && (
+        <RawData files={files} errors={errors} onFile={onFile} supabase={supabase}
+          session={session} saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} />
+      )}
+
+      {sub === "users" && isAdmin && (
+        <div className="panel">
+          <h2>Users — who can sign in</h2>
+          <div className="banner info">
+            Add a person's email and a password here, then hand them those two things — that's how they sign in.
+            Only people in this list can see the data.
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
+            <input type="email" placeholder="Email" value={newUser.email}
+              onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
+              style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 220 }} />
+            <input type="text" placeholder="Password (min 6 chars)" value={newUser.password}
+              onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
+              style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 200 }} />
+            <button className="btn" style={{ background: "#5514b4", color: "#fff" }} onClick={addUser}>Add login</button>
+          </div>
+          {userMsg && <p className="sub" style={{ color: userMsg.err ? "#b3261e" : "#14804a", marginTop: 0 }}>{userMsg.text}</p>}
+          <table>
+            <thead><tr><th className="left">Email</th><th className="num">Role</th><th className="num"></th></tr></thead>
+            <tbody>
+              {users.map((u) => (
+                <tr key={u.email}>
+                  <td className="left mono">{u.email}</td>
+                  <td className="num">{u.is_admin ? <span className="chip matched">admin</span> : <span className="chip unmatched">viewer</span>}</td>
+                  <td className="num">
+                    {(u.email || "").toLowerCase() !== (session?.user?.email || "").toLowerCase() && (
+                      <button className="btn" onClick={() => removeUser(u.email)}>Remove</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="note">Removing someone stops them seeing the data. Password resets are done from Supabase.</p>
+        </div>
+      )}
     </>
   );
 }
