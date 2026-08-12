@@ -2289,9 +2289,13 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const wasCat = catOf(a);
       const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
       const catMoved = wasCat !== nowCat;
+      const statusMoved = String(a.status || "") !== String(b.status || "");
       rows.push({
         ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
-        change: valueMoved && catMoved ? "value+status" : valueMoved ? "value" : catMoved ? "status" : null,
+        change: valueMoved && (catMoved || statusMoved) ? "value+status"
+          : valueMoved ? "value"
+            : catMoved ? "status"
+              : statusMoved ? "status-only" : null,
       });
     }
     for (const [k, a] of snap) if (!live.has(k)) rows.push({ ...a, cat: catOf(a), change: "removed", was: a.gp, now: 0 });
@@ -2544,8 +2548,9 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
           const hue = (r) => r.change === "removed" ? "#f7c8c2"
             : r.change === "value+status" ? "#fbd5cf"
               : r.change === "status" ? "#fde2dd"
-                : r.change === "value" ? "#fdecea"
-                  : r.change === "new" ? "#e6f4ec" : undefined;
+                : r.change === "status-only" ? "#fef4f2"
+                  : r.change === "value" ? "#fdecea"
+                    : r.change === "new" ? "#e6f4ec" : undefined;
           const Line = ({ r, i }) => (
             <tr key={i} style={{ background: hue(r) }}>
               <td className="left">
@@ -2554,25 +2559,36 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                 <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.product || "-"}</div>
               </td>
               <td className="left">
-                {r.wasCat && r.wasCat !== r.cat ? (
-                  <>
-                    <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat}</span>
-                    <span style={{ margin: "0 4px", color: "#8a8aa3" }}>→</span>
-                    <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
-                    <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>
-                      {r.wasStatus || "-"} → {r.status || "-"}
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
-                    <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
-                  </>
-                )}
+                {(() => {
+                  const moved = (r.wasStatus != null && String(r.wasStatus) !== String(r.status)) || (r.wasCat && r.wasCat !== r.cat);
+                  if (!moved) return (
+                    <>
+                      <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                      <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
+                    </>
+                  );
+                  return (
+                    <>
+                      <div style={{ fontSize: 10.5, color: "#8a8aa3" }}>was</div>
+                      <div>
+                        <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat || "-"}</span>{" "}
+                        <span style={{ fontSize: 11 }}>{r.wasStatus || "-"}</span>
+                      </div>
+                      <div style={{ fontSize: 10.5, color: "#8a8aa3", marginTop: 3 }}>now</div>
+                      <div>
+                        <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat || "-"}</span>{" "}
+                        <span style={{ fontSize: 11 }}>{r.status || "-"}</span>
+                      </div>
+                    </>
+                  );
+                })()}
               </td>
               <td className="num mono">
-                {r.was != null && r.was !== r.now && <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>was {gbp0(r.was)}</div>}
-                <div>{gbp0(r.now)}</div>
+                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>was {r.was == null ? "-" : gbp0(r.was)}</div>
+                <div>now {gbp0(r.now)}</div>
+              </td>
+              <td className={"num mono " + (((r.now || 0) - (r.was || 0)) === 0 ? "" : ((r.now || 0) - (r.was || 0)) > 0 ? "pos" : "neg")}>
+                {r.was == null ? "new" : (((r.now || 0) - (r.was || 0)) > 0 ? "+" : "") + gbp0((r.now || 0) - (r.was || 0))}
               </td>
             </tr>
           );
@@ -2583,11 +2599,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
               </p>
               <div style={{ overflowX: "auto" }}>
                 <table>
-                  <thead><tr><th className="left">Order</th><th className="left">Status</th><th className="num">GP</th></tr></thead>
+                  <thead><tr>
+                    <th className="left">Order</th><th className="left">Status was → now</th>
+                    <th className="num">GP</th><th className="num">Difference</th>
+                  </tr></thead>
                   <tbody>
                     {moved.map((r, i) => <Line key={"m" + i} r={r} i={i} />)}
                     {moved.length > 0 && rest.length > 0 && (
-                      <tr><td colSpan={3} style={{ background: "#f7f6fc", fontSize: 11, color: "#8a8aa3" }}>Unchanged</td></tr>
+                      <tr><td colSpan={4} style={{ background: "#f7f6fc", fontSize: 11, color: "#8a8aa3" }}>Unchanged</td></tr>
                     )}
                     {rest.slice(0, 250).map((r, i) => <Line key={"r" + i} r={r} i={i} />)}
                   </tbody>
@@ -3167,12 +3186,13 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
         if (!a) { out.push({ ...b, mk, cat: catOf(b), was: null, now: b.gp, reason: "New since payroll" }); continue; }
         const wasCat = catOf(a), nowCat = catOf(b);
         const moved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
-        if (!moved && wasCat === nowCat) continue;
-        const reason = moved && wasCat !== nowCat ? "Value and status changed"
+        const statusMoved = String(a.status || "") !== String(b.status || "");
+        if (!moved && wasCat === nowCat && !statusMoved) continue;
+        const reason = moved && (wasCat !== nowCat || statusMoved) ? "Value and status changed"
           : moved ? ((b.gp || 0) > (a.gp || 0) ? "Value increased" : "Value reduced")
             : nowCat === "red" ? "Moved into a red status"
-              : nowCat === "payable" ? "Became payable"
-                : `Moved to ${nowCat}`;
+              : nowCat === "payable" && wasCat !== nowCat ? "Became payable"
+                : wasCat !== nowCat ? `Moved to ${nowCat}` : "Status changed";
         out.push({ ...b, mk, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp, reason });
       }
       for (const [k, a] of snap) {
@@ -3372,12 +3392,18 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
                         </td>
                         <td className="left">{periodLabel(r.mk)}</td>
                         <td className="left">
-                          {r.wasCat && r.wasCat !== r.cat ? (
+                          {(r.wasStatus != null && String(r.wasStatus) !== String(r.status)) || (r.wasCat && r.wasCat !== r.cat) ? (
                             <>
-                              <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat}</span>
-                              <span style={{ margin: "0 4px", color: "#8a8aa3" }}>→</span>
-                              <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
-                              <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.wasStatus || "-"} → {r.status || "-"}</div>
+                              <div style={{ fontSize: 10.5, color: "#8a8aa3" }}>was</div>
+                              <div>
+                                <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat || "-"}</span>{" "}
+                                <span style={{ fontSize: 11 }}>{r.wasStatus || "-"}</span>
+                              </div>
+                              <div style={{ fontSize: 10.5, color: "#8a8aa3", marginTop: 3 }}>now</div>
+                              <div>
+                                <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat || "-"}</span>{" "}
+                                <span style={{ fontSize: 11 }}>{r.status || "-"}</span>
+                              </div>
                             </>
                           ) : (
                             <>
