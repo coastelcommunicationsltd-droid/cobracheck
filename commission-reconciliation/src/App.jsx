@@ -630,8 +630,8 @@ tr.click:hover { background:#faf9ff; }
 .wip input { width:78px; padding:3px 5px; border:1px solid #e2e0ee; border-radius:5px; font-size:12px;
   text-align:center; background:#fbfaff; font-variant-numeric:tabular-nums; }
 .wip input:focus { outline:2px solid #c4bce6; background:#fff; }
-.side { width:460px; flex:0 0 460px; max-height:78vh; overflow:auto; position:sticky; top:14px; }
-@media (max-width:1200px){ .side { width:100%; flex:1 1 auto; position:static; } }
+.side { width:50%; flex:0 0 50%; max-height:82vh; overflow:auto; position:sticky; top:14px; }
+@media (max-width:1100px){ .side { width:100%; flex:1 1 auto; position:static; } }
 .lock { max-width:360px; margin:80px auto; }
 .lock input { width:100%; padding:11px 13px; border:1px solid #d3d0e6; border-radius:9px; font-size:15px; margin:12px 0; }
 .lock button { width:100%; background:#5514b4; color:#fff; border:none; padding:11px; border-radius:9px; font-weight:700; cursor:pointer; }
@@ -1073,7 +1073,6 @@ export default function ReconciliationTool() {
     ["exceptions", "Exceptions", "⚠"],
     ["obi", "OBI Checks", "☑"],
     ["reconcile", "Reconciliation", "⚖"],
-    ["monthly", "Monthly Reports", "🗓"],
     ["settings", "Settings", "⚙"],
   ];
 
@@ -1179,7 +1178,7 @@ export default function ReconciliationTool() {
             addUser={addUser} removeUser={removeUser} userMsg={userMsg}
             settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
             records={result.records} staffNames={staffNames} staff={staff} loadStaff={loadStaff} managers={staffManagers}
-            webosStatuses={webosStatuses} probe={probe} probeTables={probeTables} statusConfig={statusConfig}
+            webosStatuses={webosStatuses} probe={probe} probeTables={probeTables} statusConfig={statusConfig} statusRules={effectiveStatusRules}
           />
         )}
 
@@ -1194,18 +1193,13 @@ export default function ReconciliationTool() {
                 snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab} />
             )}
 
-            {tab === "monthly" && (
-              <MonthlyReports supabase={supabase} session={session} files={files}
-                statusRules={effectiveStatusRules} />
-            )}
-
             {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
 
             {tab === "wip" && <WipTracker files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
 
             {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
               dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}}
-              managers={staffManagers} statusRules={effectiveStatusRules} />}
+              managers={staffManagers} statusRules={effectiveStatusRules} supabase={supabase} session={session} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -2145,8 +2139,13 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
+const blankAgent = (n) => ({
+  earned: Array(n).fill(0), payable: Array(n).fill(0), claimed: Array(n).fill(0),
+  issued: Array(n).fill(0), red: Array(n).fill(0), claimedIssued: Array(n).fill(0), paid: Array(n).fill(0),
+});
+
 function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {}, dbPlansByMonth = {}, dbPlanNames = {},
-  managers = {}, statusRules = {} }) {
+  managers = {}, statusRules = {}, supabase, session }) {
   const monthlyPlans = settings.payplanMonthly || {};
   const { ns, cb } = useSourceLines(files);
   const [basis, setBasis] = useState("earned");
@@ -2157,7 +2156,6 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     return [...s].sort((a, b) => b - a);
   }, [ns]);
   const [fy, setFy] = useState(null);
-  const [drill, setDrill] = useState(null);   // { label, monthIndex }
   const year = fy ?? years[0] ?? null;
   const keys = year != null ? fyMonthKeys(year) : [];
   const idx = useMemo(() => new Map(keys.map((k, i) => [k, i])), [keys.join()]);
@@ -2175,20 +2173,81 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const i = idx.get(r.period);
       if (i == null) continue;
       const name = r.partner || r.agent || "(unassigned)";   // GP is credited to the Partner
-      if (!m.has(name)) m.set(name, { earned: keys.map(() => 0), payable: keys.map(() => 0), other: keys.map(() => 0), paid: keys.map(() => 0) });
+      if (!m.has(name)) m.set(name, blankAgent(keys.length));
       const g = m.get(name);
       const gp = r.expected || 0;
-      g.earned[i] += gp;
-      if (statusCounts(statusRules, r.status) && !isNonCommissionable(r)) g.payable[i] += gp;
-      else g.other[i] += gp;
+      const cat = isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status);
+      g[cat][i] += gp;
+      if (cat !== "red") g.earned[i] += gp;                 // Total GP ignores red
+      if (cat === "claimed" || cat === "issued") g.claimedIssued[i] += gp;
       g.paid[i] += paidByOrder.get(r.orderNum) || 0;
     }
-    for (const n of staffNames) if (!m.has(n)) m.set(n, { earned: keys.map(() => 0), payable: keys.map(() => 0), other: keys.map(() => 0), paid: keys.map(() => 0) });
+    for (const n of staffNames) if (!m.has(n)) m.set(n, blankAgent(keys.length));
     // if we have a staff list, only show those people (drops Office Doublecount, ex-staff, Tracy's team)
     const allow = new Set(staffNames.map((n) => n.toLowerCase()));
     const out = [...m.entries()].filter(([n]) => !staffNames.length || allow.has(n.toLowerCase()));
     return out.sort((a, b) => a[0].localeCompare(b[0]));   // alphabetical
   }, [ns, idx, paidByOrder, keys.join(), staffNames.join(), statusRules]);
+
+  // static month-end snapshots for this financial year
+  const [statics, setStatics] = useState({});
+  useEffect(() => {
+    if (!supabase || !session || year == null) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("recon_datasets").select("*").in("id", keys.map((mk) => `static-${mk}`));
+      if (cancelled || !data) return;
+      const out = {};
+      for (const r of data) {
+        const mk = String(r.id).replace("static-", "");
+        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+      }
+      setStatics(out);
+    })();
+    return () => { cancelled = true; };
+  }, [session, year, keys.join()]);
+
+  const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
+
+  // per agent+month: what has moved since the static snapshot
+  const changesFor = useCallback((agent, i) => {
+    const mk = keys[i];
+    const snapRows = statics[mk];
+    if (!snapRows) return null;
+    const catOf = (r) => (isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status));
+    const mine = (r) => (r.partner || r.agent || "(unassigned)") === agent;
+    const snap = new Map();
+    for (const r of snapRows) {
+      if (!mine(r)) continue;
+      const k = lineKey(r);
+      if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
+      snap.get(k).gp += r.expected || 0;
+    }
+    const live = new Map();
+    for (const r of ns) {
+      if (r.period !== mk || !mine(r)) continue;
+      const k = lineKey(r);
+      if (!live.has(k)) live.set(k, { ...r, gp: 0 });
+      live.get(k).gp += r.expected || 0;
+    }
+    const rows = [];
+    for (const [k, b] of live) {
+      const a = snap.get(k);
+      const nowCat = catOf(b);
+      if (!a) { rows.push({ ...b, cat: nowCat, change: "new", was: null, now: b.gp }); continue; }
+      const wasCat = catOf(a);
+      const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
+      const catMoved = wasCat !== nowCat;
+      rows.push({
+        ...b, cat: nowCat, wasCat, was: a.gp, now: b.gp,
+        change: valueMoved && catMoved ? "value+status" : valueMoved ? "value" : catMoved ? "status" : null,
+      });
+    }
+    for (const [k, a] of snap) if (!live.has(k)) rows.push({ ...a, cat: catOf(a), change: "removed", was: a.gp, now: 0 });
+    return rows;
+  }, [statics, ns, keys.join(), statusRules]);
+
+  const [drill, setDrill] = useState(null);   // { agent, i }
 
   // manager filter
   const [mgr, setMgr] = useState("all");
@@ -2242,10 +2301,13 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
 
+  const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
+
   return (
-    <div className="panel">
+    <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+    <div className="panel" style={{ flex: "1 1 auto", minWidth: 0 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-        <h2 style={{ margin: 0 }}>Payments per agent — {fyLabel(year)}</h2>
+        <h2 style={{ margin: 0 }}>Payroll — {fyLabel(year)}</h2>
         <div className="settings">
           <span>Financial year:</span>
           <select value={year} onChange={(e) => setFy(Number(e.target.value))}
@@ -2265,14 +2327,16 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
             <option value="earned">Total GP</option>
             <option value="payable">Payable GP only</option>
-            <option value="other">Other GP only</option>
+            <option value="claimedIssued">Claimed + Issued only</option>
             <option value="paid">Paid on Cobra</option>
           </select>
         </div>
       </div>
       <p className="note" style={{ marginTop: 6 }}>
-        Each cell shows <strong>Total GP</strong>, with <span style={{ color: "#14804a" }}>payable</span> and
-        <span style={{ color: "#8a8aa3" }}> other</span> beneath it. Red = below that agent's target for the month. Targets come from the database where available, and can be
+        Each cell shows <strong>Total GP</strong> (red statuses ignored), with{" "}
+        <span style={{ color: "#14804a" }}>payable</span> and{" "}
+        <span style={{ color: "#8a5a00" }}>claimed + issued</span> beneath it — categories come from the
+        status_config tone. Click a cell to see that month's orders on the right. Red background = below target. Targets come from the database where available, and can be
         overridden in Settings → Payplans. Tick a cell to mark the agent paid for that month.
       </p>
 
@@ -2330,15 +2394,19 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                     const marked = isMarkedPaid(name, i);
                     return (
                       <td key={i} className="num mono"
-                        style={{ background: bad && (marked || (g.paid[i] || 0) > 0) ? "#f9d9d5"
+                        onClick={() => setDrill(drill && drill.agent === name && drill.i === i ? null : { agent: name, i })}
+                        title="Click to see the orders behind this month"
+                        style={{ cursor: "pointer",
+                          boxShadow: drill && drill.agent === name && drill.i === i ? "inset 0 0 0 2px #5514b4" : undefined,
+                          background: bad && (marked || (g.paid[i] || 0) > 0) ? "#f9d9d5"
                             : bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
                           color: bad ? "#b3261e" : undefined,
                           outline: bad && (marked || (g.paid[i] || 0) > 0) ? "2px solid #b3261e" : undefined }}>
                         {basis === "earned" ? (
                           <>
                             <div><strong>{v ? gbp0(v) : "-"}</strong></div>
-                            <div style={{ fontSize: 10, color: "#14804a" }}>pay {gbp0(g.payable[i] || 0)}</div>
-                            <div style={{ fontSize: 10, color: "#8a8aa3" }}>other {gbp0(g.other[i] || 0)}</div>
+                            <div style={{ fontSize: 10, color: "#14804a" }}>payable {gbp0(g.payable[i] || 0)}</div>
+                            <div style={{ fontSize: 10, color: "#8a5a00" }}>cl+iss {gbp0(g.claimedIssued[i] || 0)}</div>
                           </>
                         ) : <div>{v ? gbp0(v) : "-"}</div>}
                         {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp0(plan)}</div>}
@@ -2358,6 +2426,70 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       </div>
       {shownAgents.length === 0 && <div className="empty">No agents match this filter.</div>}
     </div>
+
+    {drill && (
+      <div className="panel side">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h2 style={{ margin: 0 }}>{drill.agent} — {periodLabel(keys[drill.i])}</h2>
+          <button className="btn" onClick={() => setDrill(null)}>Close</button>
+        </div>
+        {!drillRows ? (
+          <div className="empty">
+            No static snapshot saved for {periodLabel(keys[drill.i])}.
+            Upload one under <strong>Settings → Monthly Reports</strong> to compare.
+          </div>
+        ) : (() => {
+          const moved = drillRows.filter((r) => r.change);
+          const rest = drillRows.filter((r) => !r.change);
+          const hue = (r) => r.change === "removed" ? "#f7c8c2"
+            : r.change === "value+status" ? "#fbd5cf"
+              : r.change === "status" ? "#fde2dd"
+                : r.change === "value" ? "#fdecea"
+                  : r.change === "new" ? "#e6f4ec" : undefined;
+          const Line = ({ r, i }) => (
+            <tr key={i} style={{ background: hue(r) }}>
+              <td className="left">
+                <div className="mono">{r.orderNum || r.netsuiteRef || "-"}</div>
+                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.company || "-"}</div>
+                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.product || "-"}</div>
+              </td>
+              <td className="left">
+                <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                {r.wasCat && r.wasCat !== r.cat && (
+                  <div className="sub" style={{ margin: 0, fontSize: 10 }}>was {r.wasCat}</div>
+                )}
+                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
+              </td>
+              <td className="num mono">
+                {r.was != null && r.was !== r.now && <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>was {gbp0(r.was)}</div>}
+                <div>{gbp0(r.now)}</div>
+              </td>
+            </tr>
+          );
+          return (
+            <>
+              <p className="note" style={{ marginTop: 6 }}>
+                Compared against the {periodLabel(keys[drill.i])} snapshot. {moved.length} line{moved.length === 1 ? "" : "s"} moved.
+              </p>
+              <div style={{ overflowX: "auto" }}>
+                <table>
+                  <thead><tr><th className="left">Order</th><th className="left">Status</th><th className="num">GP</th></tr></thead>
+                  <tbody>
+                    {moved.map((r, i) => <Line key={"m" + i} r={r} i={i} />)}
+                    {moved.length > 0 && rest.length > 0 && (
+                      <tr><td colSpan={3} style={{ background: "#f7f6fc", fontSize: 11, color: "#8a8aa3" }}>Unchanged</td></tr>
+                    )}
+                    {rest.slice(0, 250).map((r, i) => <Line key={"r" + i} r={r} i={i} />)}
+                  </tbody>
+                </table>
+              </div>
+              {rest.length > 250 && <p className="note">Showing 250 unchanged lines of {rest.length}.</p>}
+            </>
+          );
+        })()}
+      </div>
+    )}
+    </div>
   );
 }
 
@@ -2367,14 +2499,22 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 // Same rules as the SchThrive / Chris P dashboards: these statuses never count
 // towards Net GP / Net SOV. Blank status is excluded too.
 const RED_GP_STATUS = /rejected|sent to customer|cancelled then reissued|cancelled/i;
-// how a status_config "tone" maps onto whether the GP is payable
+// status_config "tone" -> how the GP is summarised.
+//   payable  = counts as Payable GP
+//   claimed  = claimed but not yet payable
+//   issued   = issued, awaiting the rest
+//   red      = ignored entirely
 const TONE_MAP = {
-  green: "counts", success: "counts", positive: "counts", good: "counts", paid: "counts",
-  red: "red", danger: "red", negative: "red", error: "red", bad: "red",
-  amber: "review", orange: "review", warning: "review", warn: "review", pending: "review",
-  grey: "review", gray: "review", neutral: "review", info: "review", blue: "review",
+  payable: "payable", payble: "payable", green: "payable", success: "payable", positive: "payable",
+  good: "payable", paid: "payable", complete: "payable",
+  claimed: "claimed", claim: "claimed", amber: "claimed", orange: "claimed", warning: "claimed", pending: "claimed",
+  issued: "issued", issue: "issued", blue: "issued", info: "issued", grey: "issued", gray: "issued", neutral: "issued",
+  red: "red", danger: "red", negative: "red", error: "red", bad: "red", cancelled: "red", rejected: "red",
 };
-const toneToTreatment = (tone) => TONE_MAP[String(tone || "").trim().toLowerCase()] || null;
+const toneCategory = (tone) => TONE_MAP[String(tone || "").trim().toLowerCase()] || null;
+const toneToTreatment = toneCategory;
+// everything except red contributes to Total GP
+const CATEGORY_COUNTS = { payable: true, claimed: true, issued: true, red: false };
 const isExcludedStatus = (st) => {
   const v = String(st || "").trim();
   if (!v) return true;
@@ -2385,10 +2525,17 @@ const statusCounts = (statusSettings, st) => {
   const key = String(st || "").trim();
   const cfg = statusSettings || {};
   const v = cfg[key] ?? cfg[key.toLowerCase()];
-  if (v === "red") return false;
-  if (v === "counts" || v === "review") return true;   // review still pays; it just needs eyes on it
+  if (v != null) return CATEGORY_COUNTS[v] !== false;   // only "red" is excluded
   return !isExcludedStatus(st);
 };
+const statusCategory = (statusSettings, st) => {
+  const key = String(st || "").trim();
+  const cfg = statusSettings || {};
+  const v = cfg[key] ?? cfg[key.toLowerCase()];
+  if (v) return v;
+  return isExcludedStatus(st) ? "red" : "payable";
+};
+
 const statusTreatment = (statusSettings, st) => {
   const key = String(st || "").trim();
   const cfg = statusSettings || {};
@@ -2398,6 +2545,13 @@ const statusTreatment = (statusSettings, st) => {
 const isNonCommissionable = (r) =>
   /non-?commissionable/i.test(String(r.productGroup2 || "")) ||
   /non-?commissionable/i.test(String(r.product || ""));
+
+const CAT_STYLE = {
+  payable: { background: "#e6f4ec", color: "#14804a" },
+  claimed: { background: "#fbf0d9", color: "#8a5a00" },
+  issued: { background: "#e8eefc", color: "#1e4fa3" },
+  red: { background: "#fbe9e7", color: "#b3261e" },
+};
 
 const RISK_LEVELS = [
   ["", "Not set"],
@@ -2417,7 +2571,7 @@ function Settings(props) {
     isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
     settings, saveSettings, settingsSaving, records, staffNames = [], staff = {}, loadStaff,
     webosStatuses = { list: [], status: 'idle' }, probe = { status: 'idle', found: [] }, probeTables,
-    statusConfig = { rows: [], status: 'idle', cols: {} }, managers = {} } = props;
+    statusConfig = { rows: [], status: 'idle', cols: {} }, managers = {}, statusRules = {} } = props;
   const [sub, setSub] = useState("risk");
   const thisFy = fyStartOf(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`);
   const planYears = [thisFy + 1, thisFy, thisFy - 1, thisFy - 2];
@@ -2427,6 +2581,7 @@ function Settings(props) {
     ["risk", "Order Statuses"],
     ["payplans", "Payplans"],
     ["rawdata", "Raw Data"],
+    ["monthly", "Monthly Reports"],
     ...(isAdmin ? [["users", "Users"]] : []),
   ];
 
@@ -2519,21 +2674,17 @@ function Settings(props) {
                         <td className="left">{st.name || <em className="sub">(blank)</em>}</td>
                         <td className="num mono">{st.nsCount || "-"}</td>
                         <td className="num mono">{st.webosCount || "-"}</td>
-                        <td className="num">{st.tone
-                          ? <span className="chip" style={{
-                              background: toneToTreatment(st.tone) === "red" ? "#fbe9e7" : toneToTreatment(st.tone) === "review" ? "#fbf0d9" : "#e6f4ec",
-                              color: toneToTreatment(st.tone) === "red" ? "#b3261e" : toneToTreatment(st.tone) === "review" ? "#8a5a00" : "#14804a",
-                            }}>{String(st.tone)}</span>
-                          : "-"}</td>
+                        <td className="num">{st.tone ? <span className="chip" style={CAT_STYLE[toneCategory(st.tone)] || {}}>{String(st.tone)}</span> : "-"}</td>
                         <td className="num mono">{st.gp ? gbp(st.gp) : "-"}</td>
                         <td className="num">
                           <select value={setting}
                             onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st.name]: e.target.value } })}
                             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13,
                               color: setting === "red" ? "#b3261e" : "#14804a", fontWeight: 600 }}>
-                            <option value="counts">Payable</option>
-                            <option value="review">Review (still payable)</option>
-                            <option value="red">Red GP (not payable)</option>
+                            <option value="payable">Payable</option>
+                            <option value="claimed">Claimed</option>
+                            <option value="issued">Issued</option>
+                            <option value="red">Red (ignored)</option>
                           </select>
                         </td>
                       </tr>
@@ -2704,6 +2855,10 @@ function Settings(props) {
             </div>
           )}
         </div>
+      )}
+
+      {sub === "monthly" && (
+        <MonthlyReports supabase={supabase} session={session} files={files} statusRules={statusRules} />
       )}
 
       {sub === "rawdata" && (
