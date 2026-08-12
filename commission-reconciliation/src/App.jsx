@@ -1195,7 +1195,8 @@ export default function ReconciliationTool() {
 
             {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
 
-            {tab === "wip" && <WipTracker files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
+            {tab === "wip" && <WipTracker files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings}
+              settingsSaving={settingsSaving} supabase={supabase} session={session} />}
 
             {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
               dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}}
@@ -1848,7 +1849,7 @@ function useSourceLines(files) {
 // =========================================================================
 //  WIP Tracker — replica of the monthly GP/WIP sheet
 // =========================================================================
-function WipTracker({ files, settings, saveSettings, settingsSaving }) {
+function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, session }) {
   const statusSettings = settings.risk || {};
   const { ns } = useSourceLines(files);
 
@@ -1885,6 +1886,35 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
     return { latestStats, paidCobra, unpaidWip, accOwed, accPaid, overage, redGp };
   }, [ns, keys.join(), statusSettings]);
 
+  // ---- "Original Payroll stats GP" comes from the static month-end snapshots ----
+  const [statics, setStatics] = useState({});
+  useEffect(() => {
+    if (!supabase || !session || year == null) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("recon_datasets").select("*").in("id", keys.map((mk) => `static-${mk}`));
+      if (cancelled || !data) return;
+      const out = {};
+      for (const r of data) {
+        const mk = String(r.id).replace("static-", "");
+        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+      }
+      setStatics(out);
+    })();
+    return () => { cancelled = true; };
+  }, [session, year, keys.join()]);
+
+  const origPayrollFromStatic = useMemo(() => keys.map((mk) => {
+    const rows = statics[mk];
+    if (!rows) return null;                       // no snapshot for that month yet
+    let t = 0;
+    for (const r of rows) {
+      if (!statusCounts(statusSettings, r.status) || isNonCommissionable(r)) continue;
+      t += r.expected || 0;
+    }
+    return t;
+  }), [statics, keys.join(), statusSettings]);
+
   // ---- manual rows, stored in shared settings ----
   const wipAll = settings.wip || {};
   const manual = (wipAll[year] || {});
@@ -1902,7 +1932,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 
   const rowVals = (rowKey) => keys.map((_, i) => getM(rowKey, i));
   const netOrig = rowVals("netOriginal");
-  const origPayroll = rowVals("originalPayroll");
+  const origPayroll = origPayrollFromStatic;
   // "Latest Payroll GP" is no longer typed in: it now follows payable GP (statuses that count).
   const latestPayroll = rep.latestStats;
   const pillar = rowVals("pillar");
@@ -2037,7 +2067,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
             </thead>
             <tbody>
               <Row label="Net Original stats GP" tag="Manual" kind="input" rowKey="netOriginal" vals={netOrig} />
-              <Row label="Original Payroll stats GP" tag="Manual" kind="input" rowKey="originalPayroll" vals={origPayroll} />
+              <Row label="Original Payroll stats GP" tag="Report" vals={origPayroll} />
               <Row group label="Net Vs Latest Diff" tag="Formula" vals={netVsLatest} danger={(v) => v > 0} />
               <Row group label="Latest stats" tag="Report" vals={rep.latestStats} />
               <Row label="Latest Paid on Cobra" tag="Report" vals={rep.paidCobra} />
@@ -2065,6 +2095,8 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           Net Vs Latest Diff = Net Original − Latest stats · Change in Value = Net Original − Latest Payroll ·
           How Much Cancelled = Net Vs Latest Diff ÷ Net Original · How much has been paid = Paid on Cobra ÷ Latest stats ·
           Overage = Paid on Cobra − Latest stats.
+          <br /><strong>Original Payroll stats GP</strong> comes from the static month-end snapshots uploaded under
+          Settings → Monthly Reports (payable GP only); months with no snapshot show "-".
           <br /><strong>Note:</strong> "Latest Payroll GP" is no longer typed in — it now follows payable GP
           (everything except Red GP statuses), which is what feeds "Change From Original to Payroll" and "Change in Value".
         </p>
@@ -2076,7 +2108,10 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           const seenDoc = new Set();
           let list = [];
           const counted = (r) => statusCounts(statusSettings, r.status) && !isNonCommissionable(r);
-          if (drill.label === "Latest stats") list = inMonth.filter(counted);
+          if (drill.label === "Original Payroll stats GP") {
+            list = (statics[mk] || []).filter((r) => statusCounts(statusSettings, r.status) && !isNonCommissionable(r));
+          }
+          else if (drill.label === "Latest stats") list = inMonth.filter(counted);
           else if (drill.label === "O/S unpaid WIP") list = inMonth.filter((r) => counted(r) && (r.itemPaid != null ? !isYes(r.itemPaid) : !r.statusPaid));
           else if (drill.label === "Latest Paid on Cobra") list = inMonth.filter((r) => {
             if (r.recordedCobra == null) return false;
@@ -2177,6 +2212,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const g = m.get(name);
       const gp = r.expected || 0;
       const cat = isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status);
+      if (!g[cat]) g[cat] = Array(keys.length).fill(0);   // guard against an unexpected category
       g[cat][i] += gp;
       if (cat !== "red") g.earned[i] += gp;                 // Total GP ignores red
       if (cat === "claimed" || cat === "issued") g.claimedIssued[i] += gp;
@@ -2524,14 +2560,23 @@ const isExcludedStatus = (st) => {
 const statusCounts = (statusSettings, st) => {
   const key = String(st || "").trim();
   const cfg = statusSettings || {};
-  const v = cfg[key] ?? cfg[key.toLowerCase()];
-  if (v != null) return CATEGORY_COUNTS[v] !== false;   // only "red" is excluded
+  const v = normaliseCategory(cfg[key] ?? cfg[key.toLowerCase()]);
+  if (v) return CATEGORY_COUNTS[v] !== false;   // only "red" is excluded
   return !isExcludedStatus(st);
+};
+// always returns one of: payable | claimed | issued | red.
+// Older saved settings used "counts"/"review", so those are mapped rather than trusted.
+const LEGACY_CATEGORY = { counts: "payable", review: "claimed", none: "payable", low: "payable",
+  medium: "claimed", high: "red", "": "payable" };
+const normaliseCategory = (v) => {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "payable" || s === "claimed" || s === "issued" || s === "red") return s;
+  return LEGACY_CATEGORY[s] || null;
 };
 const statusCategory = (statusSettings, st) => {
   const key = String(st || "").trim();
   const cfg = statusSettings || {};
-  const v = cfg[key] ?? cfg[key.toLowerCase()];
+  const v = normaliseCategory(cfg[key] ?? cfg[key.toLowerCase()]);
   if (v) return v;
   return isExcludedStatus(st) ? "red" : "payable";
 };
@@ -2587,6 +2632,17 @@ function Settings(props) {
 
   // every order status seen in the loaded data
   const { nameCol: scName, toneCol: scTone } = statusConfig.cols || {};
+  // offer the tone words this business actually uses, falling back to the four categories
+  const toneOptions = useMemo(() => {
+    const seen = new Map();
+    if (scTone) for (const r of statusConfig.rows) {
+      const t = String(r[scTone] || "").trim();
+      const cat = toneCategory(t);
+      if (t && cat && !seen.has(cat)) seen.set(cat, t);
+    }
+    for (const c of ["payable", "claimed", "issued", "red"]) if (!seen.has(c)) seen.set(c, c);
+    return [...seen.entries()];   // [category, label]
+  }, [statusConfig, scTone]);
   const allStatuses = useMemo(() => {
     const m = new Map();
     const get = (name) => {
@@ -2681,10 +2737,11 @@ function Settings(props) {
                             onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st.name]: e.target.value } })}
                             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13,
                               color: setting === "red" ? "#b3261e" : "#14804a", fontWeight: 600 }}>
-                            <option value="payable">Payable</option>
-                            <option value="claimed">Claimed</option>
-                            <option value="issued">Issued</option>
-                            <option value="red">Red (ignored)</option>
+                            {toneOptions.map(([cat, label]) => (
+                              <option key={cat} value={cat}>
+                                {label}{cat === "red" ? " (ignored)" : ""}
+                              </option>
+                            ))}
                           </select>
                         </td>
                       </tr>
@@ -2937,9 +2994,14 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
       cobraPaymentCol += r.recordedCobra || 0;              // NetSuite "Cobra Payment" column
       if (r.inCobra && !r.inNS) cobraUnmatched += r.paid || 0;   // C but not N
       if (r.inSch5 && !r.inNS) sch5Unmatched += r.s5Sov || 0;    // S but not N
-      if (r.flags.some((f) => f.sev === 3)) nException++;
-      else if (r.flags.length) nReview++;
-      else nMatched++;
+      // NetSuite vs Cobra: does what NetSuite expects agree with what Cobra paid?
+      const hasNs = r.inNS, hasCb = r.inCobra;
+      if (!hasNs || !hasCb) { nException++; continue; }      // only on one side
+      const d = (r.paid || 0) - (r.expected || 0);
+      const base = Math.max(Math.abs(r.paid || 0), Math.abs(r.expected || 0), 1);
+      if (Math.abs(d) < 0.005) nMatched++;
+      else if (Math.abs(d) / base <= 0.01) nReview++;        // within 1%
+      else nException++;
     }
     const nTotal = Math.max(1, nMatched + nReview + nException);
     return {
@@ -3118,13 +3180,13 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
         </div>
 
         <div className="panel">
-          <h2>Reconciliation status</h2>
+          <h2>Reconciliation status — NetSuite vs Cobra</h2>
           <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
             <Donut matched={k.pctMatched} review={k.pctReview} exception={k.pctException} />
             <div style={{ fontSize: 13 }}>
               {[["Matched", k.pctMatched, "#14804a", k.nMatched],
-                ["Review", k.pctReview, "#d98a00", k.nReview],
-                ["Exception", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
+                ["Within 1%", k.pctReview, "#d98a00", k.nReview],
+                ["Mismatch", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
                 <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
                   <i style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
                   <span style={{ minWidth: 78 }}>{l}</span>
