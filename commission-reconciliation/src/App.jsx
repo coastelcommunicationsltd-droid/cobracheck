@@ -549,6 +549,29 @@ export default function ReconciliationTool() {
   // Stored as a second row (id='settings') in the SAME table — no database change needed.
   const [settings, setSettings] = useState({ risk: {}, payplans: {}, paidMarks: {}, wip: {} });
   const [settingsSaving, setSettingsSaving] = useState(false);
+  // agent list from the existing SchThrive `staff` table (read-only; no schema change)
+  const [staff, setStaff] = useState({ rows: [], status: "idle", planCol: null });
+
+  const loadStaff = useCallback(async () => {
+    if (!supabase || !session) return;
+    setStaff((s) => ({ ...s, status: "loading" }));
+    const { data, error } = await supabase.from("staff").select("*");
+    if (error || !data) { setStaff({ rows: [], status: "error", planCol: null, msg: error?.message }); return; }
+    const cols = data.length ? Object.keys(data[0]) : [];
+    const planCol = cols.find((c) => /pay ?_?plan|target|quota/i.test(c)) || null;
+    setStaff({ rows: data, status: "ok", planCol });
+  }, [session]);
+
+  useEffect(() => { loadStaff(); }, [loadStaff]);
+
+  const staffNames = useMemo(() => {
+    const nameCol = staff.rows.length
+      ? Object.keys(staff.rows[0]).find((c) => /^(name|full_?name|agent)$/i.test(c)) ||
+        Object.keys(staff.rows[0]).find((c) => /name/i.test(c))
+      : null;
+    if (!nameCol) return [];
+    return staff.rows.map((r) => String(r[nameCol] || "").trim()).filter(Boolean).sort();
+  }, [staff]);
 
   useEffect(() => {
     if (!supabase || !session) return;
@@ -773,7 +796,7 @@ export default function ReconciliationTool() {
 
   const TABS = [
     ["cross", "Cross-Reference"],
-    ["wip", "WIP Tracker"],
+    ["wip", "Cobra Dashboard"],
     ["agents", "Payments Per Agent"],
     ["btpay", "BT Payment Check"],
     ["exceptions", "Exceptions & Risk"],
@@ -866,7 +889,7 @@ export default function ReconciliationTool() {
             isAdmin={isAdmin} users={users} newUser={newUser} setNewUser={setNewUser}
             addUser={addUser} removeUser={removeUser} userMsg={userMsg}
             settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
-            records={result.records}
+            records={result.records} staffNames={staffNames} staff={staff} loadStaff={loadStaff}
           />
         )}
 
@@ -880,7 +903,7 @@ export default function ReconciliationTool() {
 
             {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
 
-            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} />}
+            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -1527,7 +1550,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
   // ---- figures that come straight from the reports ----
   const rep = useMemo(() => {
     const z = () => keys.map(() => 0);
-    const latestStats = z(), paidCobra = z(), unpaidWip = z(), accOwed = z(), accPaid = z();
+    const latestStats = z(), paidCobra = z(), unpaidWip = z(), accOwed = z(), accPaid = z(), overage = z();
     const idx = new Map(keys.map((k, i) => [k, i]));
     for (const r of ns) {
       const i = idx.get(r.period);
@@ -1536,13 +1559,14 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
       latestStats[i] += gp;
       if (r.itemPaid != null && !isYes(r.itemPaid)) unpaidWip[i] += gp;
       if (isYes(r.accelerator)) { accOwed[i] += gp; accPaid[i] += r.recordedCobra || 0; }
+      overage[i] += money(r.overpayment) || 0;
     }
     for (const r of cb) {
       const i = idx.get(r.period);
       if (i == null) continue;
       paidCobra[i] += r.paid || 0;
     }
-    return { latestStats, paidCobra, unpaidWip, accOwed, accPaid };
+    return { latestStats, paidCobra, unpaidWip, accOwed, accPaid, overage };
   }, [ns, cb, keys.join()]);
 
   // ---- manual rows, stored in shared settings ----
@@ -1568,15 +1592,22 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
   const accUplift = rowVals("accUplift");
 
   // ---- formulas ----
-  const netVsLatest = keys.map((_, i) => (netOrig[i] == null ? null : netOrig[i] - rep.latestStats[i]));
-  const changeToPayroll = keys.map((_, i) => pct(latestPayroll[i], netOrig[i]));
-  const changeInValue = keys.map((_, i) => (netOrig[i] == null || latestPayroll[i] == null ? null : netOrig[i] - latestPayroll[i]));
-  const cancelled = keys.map((_, i) => (netOrig[i] ? pct(netVsLatest[i], netOrig[i]) : null));
+  const n0 = (v) => (v == null ? 0 : v);
+  const netVsLatest = keys.map((_, i) => n0(netOrig[i]) - rep.latestStats[i]);
+  const changeToPayroll = keys.map((_, i) => pct(n0(latestPayroll[i]), n0(netOrig[i])));
+  const changeInValue = keys.map((_, i) => n0(netOrig[i]) - n0(latestPayroll[i]));
+  const cancelled = keys.map((_, i) => pct(netVsLatest[i], n0(netOrig[i])));
   const paidPct = keys.map((_, i) => pct(rep.paidCobra[i], rep.latestStats[i]));
-  const overage = keys.map((_, i) => rep.paidCobra[i] - rep.latestStats[i]);
+
 
   const tot = (arr) => sum(arr.filter((v) => v != null));
   const cellNum = (v) => (v == null ? "-" : gbp(v));
+
+  const totalPct = {
+    "Change From Original to Payroll": pct(tot(latestPayroll), tot(netOrig)),
+    "How Much Cancelled?": pct(tot(netVsLatest), tot(netOrig)),
+    "How much has been paid?": pct(tot(rep.paidCobra), tot(rep.latestStats)),
+  };
 
   const Row = ({ label, tag, vals, kind, rowKey, danger }) => (
     <tr>
@@ -1598,11 +1629,22 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           ) : kind === "pct" ? fmtPct(v) : cellNum(v)}
         </td>
       ))}
-      <td className="num mono"><strong>{kind === "pct" ? "-" : gbp(tot(vals))}</strong></td>
+      <td className="num mono"><strong>{kind === "pct" ? fmtPct(totalPct[label]) : gbp(tot(vals))}</strong></td>
     </tr>
   );
 
   // unpaid WIP split by product group, for the summary strip
+  const diag = useMemo(() => {
+    let nsIn = 0, cbIn = 0, nsNoDate = 0, nsOther = 0;
+    for (const r of ns) {
+      if (!r.period) nsNoDate++;
+      else if (fyStartOf(r.period) === year) nsIn++;
+      else nsOther++;
+    }
+    for (const r of cb) if (r.period && fyStartOf(r.period) === year) cbIn++;
+    return { nsIn, cbIn, nsNoDate, nsOther };
+  }, [ns, cb, year]);
+
   const wipByProduct = useMemo(() => {
     const m = new Map();
     for (const r of ns) {
@@ -1646,7 +1688,16 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
       </div>
 
       <div className="panel">
-        <h2>{fyLabel(year)} — monthly GP tracker</h2>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <h2 style={{ margin: 0 }}>{fyLabel(year)} — monthly GP tracker</h2>
+          <div className="settings">
+            <span>Financial year:</span>
+            <select value={year} onChange={(e) => setFy(Number(e.target.value))}
+              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+              {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+            </select>
+          </div>
+        </div>
         <p className="note" style={{ marginTop: 0 }}>
           <span className="chip unmatched" style={{ fontSize: 10 }}>Manual</span> you type ·
           <span className="chip matched" style={{ fontSize: 10, marginLeft: 6 }}>Report</span> from NetSuite/Cobra ·
@@ -1678,10 +1729,16 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
               <Row label="How much has been paid?" tag="Formula" kind="pct" vals={paidPct} />
               <Row label="Accelerator Owed" tag="Report" vals={rep.accOwed} />
               <Row label="Accelerator Paid" tag="Report" vals={rep.accPaid} />
-              <Row label="Overage" tag="Formula" vals={overage} />
+              <Row label="Overage" tag="Report" vals={rep.overage} />
             </tbody>
           </table>
         </div>
+        <p className="note">
+          <strong>Where the months come from:</strong> NetSuite rows are placed by <span className="mono">Netsuite Date</span> (read as day/month/year);
+          Cobra rows by its own <span className="mono">Month</span> + <span className="mono">FY</span> columns.
+          {" "}{diag.nsIn} NetSuite and {diag.cbIn} Cobra rows fall in {fyLabel(year)}; {diag.nsNoDate} NetSuite rows have no readable date
+          {diag.nsOther > 0 ? ` and ${diag.nsOther} sit in other years` : ""}.
+        </p>
         <p className="note">
           Net Vs Latest Diff = Net Original − Latest stats · Change in Value = Net Original − Latest Payroll ·
           How Much Cancelled = Net Vs Latest Diff ÷ Net Original · How much has been paid = Paid on Cobra ÷ Latest stats ·
@@ -1695,7 +1752,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
-function AgentPayments({ files, settings, saveSettings }) {
+function AgentPayments({ files, settings, saveSettings, staffNames = [] }) {
   const { ns, cb } = useSourceLines(files);
   const [basis, setBasis] = useState("earned");
 
@@ -1727,8 +1784,10 @@ function AgentPayments({ files, settings, saveSettings }) {
       g.earned[i] += r.expected || 0;
       g.paid[i] += paidByOrder.get(r.orderNum) || 0;
     }
+    // make sure everyone on the staff list appears, even with no orders this year
+    for (const n of staffNames) if (!m.has(n)) m.set(n, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
     return [...m.entries()].sort((a, b) => sum(b[1].earned) - sum(a[1].earned));
-  }, [ns, idx, paidByOrder, keys.join()]);
+  }, [ns, idx, paidByOrder, keys.join(), staffNames.join()]);
 
   const payplans = settings.payplans || {};
   const paidMarks = settings.paidMarks || {};
@@ -1833,7 +1892,7 @@ const riskChip = (lvl) => {
 function Settings(props) {
   const { files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded,
     isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
-    settings, saveSettings, settingsSaving, records } = props;
+    settings, saveSettings, settingsSaving, records, staffNames = [], staff = {}, loadStaff } = props;
   const [sub, setSub] = useState("risk");
 
   const SUBS = [
@@ -1851,10 +1910,10 @@ function Settings(props) {
   }, [records]);
 
   const agentNames = useMemo(() => {
-    const s = new Set();
+    const s = new Set(staffNames);
     records.forEach((r) => { if (r.agent) s.add(r.agent); });
     return [...s].sort();
-  }, [records]);
+  }, [records, staffNames.join()]);
 
   const risk = settings.risk || {};
   const payplans = settings.payplans || {};
@@ -1907,6 +1966,16 @@ function Settings(props) {
             The monthly commission each agent is expected to hit. On the Payments Per Agent tab, any month
             below this figure is flagged red.
           </p>
+          <div className="settings" style={{ marginBottom: 12 }}>
+            <button className="btn" onClick={loadStaff}>Reload agents from staff list</button>
+            <span className="sub" style={{ margin: 0 }}>
+              {staff.status === "ok"
+                ? `${staffNames.length} agents from the staff table${staff.planCol ? ` (payplan column "${staff.planCol}" found)` : " — no payplan column found, so set them here"}`
+                : staff.status === "error"
+                  ? "Couldn't read the staff table — showing only agents found in NetSuite."
+                  : "Loading the staff list…"}
+            </span>
+          </div>
           {agentNames.length === 0 ? (
             <div className="empty">No agents found — load the NetSuite export first.</div>
           ) : (
