@@ -279,7 +279,7 @@ const cobraRow = (r) => ({
   paid: money(pick(r, ["Commission Paid"])), // what BT actually paid
   product: firstDefined(pick(r, ["Measure", "Plan Name"])),
   prodCode: firstDefined(pick(r, ["Prod Code"])),
-  date: pick(r, ["Closed Date", "Order Date"]),
+  date: firstDefined(pickExact(r, ["Order Date"]), pickExact(r, ["Closed Date"])),
   cobraMonth: firstDefined(pick(r, ["Month"])),
   cobraFy: firstDefined(pick(r, ["FY"])),
   raw: r,
@@ -288,7 +288,11 @@ const cobraRow = (r) => ({
 // Cobra ships its own commission-run month + financial year (e.g. Month "Apr", FY "FY2026").
 // FY2026 runs Apr 2026 -> Mar 2027, so months Jan-Mar belong to the following calendar year.
 const MONTH_ABBR = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+// Month comes from Cobra's "Order Date" column, read as UK day/month/year.
+// The Month + FY columns are only a fallback when Order Date is missing.
 const cobraPeriod = (r) => {
+  const fromDate = monthKey(r.date);
+  if (fromDate) return fromDate;
   const mi = MONTH_ABBR.indexOf(String(r.cobraMonth || "").trim().slice(0, 3).toLowerCase());
   const fy = String(r.cobraFy || "").match(/(\d{4})/);
   if (mi >= 0 && fy) {
@@ -296,7 +300,7 @@ const cobraPeriod = (r) => {
     const year = mi >= 3 ? startYear : startYear + 1; // Apr(3)..Dec stay, Jan-Mar roll over
     return `${year}-${String(mi + 1).padStart(2, "0")}`;
   }
-  return monthKey(r.date);
+  return null;
 };
 
 const sch5Row = (r) => ({
@@ -313,7 +317,8 @@ const sch5Row = (r) => ({
   product: firstDefined(pick(r, ["PRODUCT SUB NAME1"])),
   transactional: firstDefined(pick(r, ["TRANSACTIONAL"])),
   recentCancel: firstDefined(pick(r, ["RECENT CANCELLATION"])),
-  date: firstDefined(pickExact(r, ["ORDER DATE"]), pickExact(r, ["CLOSED DATE"]), pickExact(r, ["REPORTING MONTH"])),
+  // month comes from the Sch5 "Order Date" column, read as UK day/month/year
+  date: pickExact(r, ["ORDER DATE"]),
   // "Order" flag: use a literal ORDER column if the export has one, else COMMISSION FLAG
   orderFlag: firstDefined(pickExact(r, ["SCH5 ORDER"]), pickExact(r, ["ORDER"]), pickExact(r, ["COMMISSION FLAG"])),
   orderFlagCol: pickExact(r, ["SCH5 ORDER"]) != null ? "SCH5 ORDER"
@@ -674,8 +679,25 @@ export default function ReconciliationTool() {
   const [staff, setStaff] = useState({ rows: [], status: "idle", planCol: null });
   // tracks which slots the user has replaced in this session, so a late DB read can't overwrite them
   const uploadedHere = useRef({});
+  const settingsRef = useRef({});
 
   const EXCLUDED_MANAGER = "tracy webber";
+
+  // We can't list tables through the API, so try likely names and report what exists.
+  const PLAN_TABLE_CANDIDATES = ["payplans", "payplan", "pay_plans", "pay_plan", "agent_payplans",
+    "staff_payplans", "targets", "agent_targets", "commission_plans", "staff"];
+  const [probe, setProbe] = useState({ status: "idle", found: [] });
+
+  const probeTables = useCallback(async () => {
+    if (!supabase || !session) return;
+    setProbe({ status: "loading", found: [] });
+    const found = [];
+    for (const t of PLAN_TABLE_CANDIDATES) {
+      const { data, error } = await supabase.from(t).select("*").limit(1);
+      if (!error && data) found.push({ table: t, cols: data.length ? Object.keys(data[0]) : [], rows: data.length });
+    }
+    setProbe({ status: "done", found });
+  }, [session]);
 
   const loadStaff = useCallback(async () => {
     if (!supabase || !session) return;
@@ -689,6 +711,30 @@ export default function ReconciliationTool() {
     const rows = data.filter((r) => !mgrCols.some((c) => String(r[c] || "").toLowerCase().includes(EXCLUDED_MANAGER)));
     // payplans may live in their own table; fall back to a column on staff
     let plans = {};
+    const cfg = (settingsRef.current || {}).payplanSource;
+    let plansByMonth = {}, planNames = {};
+    if (cfg && cfg.table && cfg.nameCol && cfg.valueCol) {
+      const { data: cd } = await supabase.from(cfg.table).select("*");
+      if (cd) {
+        for (const r of cd) {
+          const nm = String(r[cfg.nameCol] || "").trim();
+          if (!nm) continue;
+          const amt = Number(r[cfg.valueCol]) || 0;
+          const mk = cfg.monthCol ? planMonthKey(r[cfg.monthCol]) : null;
+          if (mk) {
+            plansByMonth[nm] = plansByMonth[nm] || {};
+            plansByMonth[nm][mk] = amt;
+          } else {
+            plans[nm] = amt;              // no month column -> a standing plan
+          }
+          if (cfg.planNameCol && r[cfg.planNameCol]) {
+            planNames[nm] = planNames[nm] || {};
+            planNames[nm][mk || "all"] = String(r[cfg.planNameCol]);
+          }
+        }
+        setStaff((st) => ({ ...st, plans, plansByMonth, planNames, planSource: `${cfg.table}.${cfg.valueCol}` }));
+      }
+    }
     const nameOf = (r) => {
       const nc = cols.find((c) => /^(name|full_?name|agent)$/i.test(c)) || cols.find((c) => /name/i.test(c));
       return nc ? String(r[nc] || "").trim() : "";
@@ -749,6 +795,8 @@ export default function ReconciliationTool() {
     })();
     return () => { cancelled = true; };
   }, [session]);
+
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   const saveSettings = useCallback(async (next) => {
     setSettings(next);
@@ -1082,7 +1130,7 @@ export default function ReconciliationTool() {
             addUser={addUser} removeUser={removeUser} userMsg={userMsg}
             settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
             records={result.records} staffNames={staffNames} staff={staff} loadStaff={loadStaff}
-            webosStatuses={webosStatuses}
+            webosStatuses={webosStatuses} probe={probe} probeTables={probeTables}
           />
         )}
 
@@ -1101,7 +1149,8 @@ export default function ReconciliationTool() {
 
             {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
 
-            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames} dbPlans={staff.plans || {}} />}
+            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
+              dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -1719,6 +1768,19 @@ const fyLabel = (start) => `${start}>${start + 1}`;
 const fyMonthKeys = (start) =>
   MONTHS_FY.map(([mm]) => `${Number(mm) >= 4 ? start : start + 1}-${mm}`);
 
+// a payplan month column could hold "2026-04", "202604", "01/04/2026", "Apr 2026", "April 2026"…
+const MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const planMonthKey = (v) => {
+  if (v == null || v === "") return null;
+  const direct = monthKey(v);
+  if (direct) return direct;
+  const s = String(v).trim().toLowerCase();
+  const yr = s.match(/(20\d{2})/);
+  const nm = MONTH_NAMES.findIndex((m) => s.includes(m));
+  if (yr && nm >= 0) return `${yr[1]}-${String(nm + 1).padStart(2, "0")}`;
+  return null;
+};
+
 const pct = (n, d) => (!d ? null : (n / d) * 100);
 const fmtPct = (v) => (v == null ? "-" : v.toFixed(2) + "%");
 const gbp0 = (n) =>
@@ -2028,7 +2090,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
-function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {} }) {
+function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {}, dbPlansByMonth = {}, dbPlanNames = {} }) {
   const monthlyPlans = settings.payplanMonthly || {};
   const { ns, cb } = useSourceLines(files);
   const [basis, setBasis] = useState("earned");
@@ -2083,13 +2145,34 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
   const planFor = (agent, i) => {
     const m = monthlyPlans[year]?.[agent]?.[i];
     if (m !== "" && m != null) return Number(m);
+    const fromDb = dbPlansByMonth[agent]?.[keys[i]];       // what the database says they were on that month
+    if (fromDb != null) return Number(fromDb);
     const std = payplans[agent];
     return std === "" || std == null ? 0 : Number(std);
   };
+  const planNameFor = (agent, i) => dbPlanNames[agent]?.[keys[i]] || dbPlanNames[agent]?.all || null;
   const below = (agent, v, i) => {
     const plan = planFor(agent, i);
     return plan > 0 && v < plan;
   };
+
+  // paid in a month where the agent didn't reach their target
+  const breaches = useMemo(() => {
+    const out = [];
+    for (const [name, g] of agents) {
+      keys.forEach((mk, i) => {
+        const target = planFor(name, i);
+        if (!(target > 0)) return;
+        const earned = g.earned[i] || 0;
+        const paidOut = g.paid[i] || 0;
+        const marked = isMarkedPaid(name, i);
+        if (earned < target && (paidOut > 0 || marked)) {
+          out.push({ name, i, mk, target, earned, paidOut, marked, shortfall: target - earned, plan: planNameFor(name, i) });
+        }
+      });
+    }
+    return out.sort((a, b) => b.shortfall - a.shortfall);
+  }, [agents, keys.join(), monthlyPlans, payplans, dbPlansByMonth, paidMarks]);
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
 
@@ -2113,8 +2196,38 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
         </div>
       </div>
       <p className="note" style={{ marginTop: 6 }}>
-        Red = below that agent's payplan for the month (set payplans in Settings). Tick a cell to mark the agent paid for that month.
+        Red = below that agent's target for the month. Targets come from the database where available, and can be
+        overridden in Settings → Payplans. Tick a cell to mark the agent paid for that month.
       </p>
+
+      {breaches.length > 0 && (
+        <div className="banner" style={{ marginBottom: 12 }}>
+          <strong>{breaches.length} payment{breaches.length > 1 ? "s" : ""} made in a month below target.</strong>
+          <div style={{ overflowX: "auto", marginTop: 8 }}>
+            <table>
+              <thead><tr>
+                <th className="left">Agent</th><th className="left">Month</th><th className="left">Plan</th>
+                <th className="num">Target</th><th className="num">GP earned</th><th className="num">Shortfall</th>
+                <th className="num">Paid</th>
+              </tr></thead>
+              <tbody>
+                {breaches.slice(0, 40).map((b, n) => (
+                  <tr key={n}>
+                    <td className="left">{b.name}</td>
+                    <td className="left">{periodLabel(b.mk)}</td>
+                    <td className="left">{b.plan || "-"}</td>
+                    <td className="num mono">{gbp0(b.target)}</td>
+                    <td className="num mono">{gbp0(b.earned)}</td>
+                    <td className="num mono neg">{gbp0(b.shortfall)}</td>
+                    <td className="num mono">{b.paidOut > 0 ? gbp0(b.paidOut) : (b.marked ? "marked paid" : "-")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {breaches.length > 40 && <p className="note">Showing 40 of {breaches.length}.</p>}
+        </div>
+      )}
       <div style={{ overflowX: "auto" }}>
         <table>
           <thead>
@@ -2138,8 +2251,10 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                     const marked = isMarkedPaid(name, i);
                     return (
                       <td key={i} className="num mono"
-                        style={{ background: bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
-                          color: bad ? "#b3261e" : undefined }}>
+                        style={{ background: bad && (marked || (g.paid[i] || 0) > 0) ? "#f9d9d5"
+                            : bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
+                          color: bad ? "#b3261e" : undefined,
+                          outline: bad && (marked || (g.paid[i] || 0) > 0) ? "2px solid #b3261e" : undefined }}>
                         <div>{v ? gbp(v) : "-"}</div>
                         {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp(plan)}</div>}
                         <label style={{ fontSize: 10, color: "#8a8aa3", cursor: "pointer", display: "inline-flex", gap: 3, alignItems: "center" }}>
@@ -2201,7 +2316,7 @@ function Settings(props) {
   const { files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded,
     isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
     settings, saveSettings, settingsSaving, records, staffNames = [], staff = {}, loadStaff,
-    webosStatuses = { list: [], status: 'idle' } } = props;
+    webosStatuses = { list: [], status: 'idle' }, probe = { status: 'idle', found: [] }, probeTables } = props;
   const [sub, setSub] = useState("risk");
   const thisFy = fyStartOf(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`);
   const planYears = [thisFy + 1, thisFy, thisFy - 1, thisFy - 2];
@@ -2241,6 +2356,9 @@ function Settings(props) {
   const suggestedRisk = (st) => (isExcludedStatus(st) ? "high" : "");
   const payplans = settings.payplans || {};
   const dbPlans = staff.plans || {};
+  const cfg = settings.payplanSource || {};
+  const cfgCols = (probe.found.find((f) => f.table === cfg.table) || {}).cols || [];
+  const selStyle = { padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 };
 
   return (
     <>
@@ -2318,6 +2436,79 @@ function Settings(props) {
             The commission each agent had to hit that month. Any month below this is flagged red on Payments Per Agent.
             Leave a month blank to fall back to the agent's standard payplan.
           </p>
+          <div className="panel" style={{ background: "#faf9ff", marginBottom: 14 }}>
+            <h2 style={{ marginBottom: 8 }}>Where payplans come from</h2>
+            {!cfg.table ? (
+              <p className="note" style={{ marginTop: 0 }}>
+                Not linked to the database yet — payplans typed below are used instead.
+                Click <strong>Find payplan tables</strong> and I'll check the database for one.
+              </p>
+            ) : (
+              <p className="note" style={{ marginTop: 0 }}>
+                Reading from <span className="mono">{cfg.table}</span> — name <span className="mono">{cfg.nameCol}</span>,
+                amount <span className="mono">{cfg.valueCol}</span>
+                {cfg.monthCol ? <> , month <span className="mono">{cfg.monthCol}</span></> : " (no month column — one standing plan per agent)"}.
+                {" "}{Object.keys(staff.plansByMonth || {}).length
+                  ? `${Object.keys(staff.plansByMonth).length} agents have month-by-month targets.`
+                  : Object.keys(dbPlans).length ? `${Object.keys(dbPlans).length} standing payplans loaded.` : "No rows matched yet."}
+              </p>
+            )}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button className="btn" onClick={probeTables}>
+                {probe.status === "loading" ? "Checking…" : "Find payplan tables"}
+              </button>
+              {probe.status === "done" && probe.found.length === 0 && (
+                <span className="sub" style={{ margin: 0, color: "#b3261e" }}>
+                  No matching tables found. Tell me the table name and I'll add it.
+                </span>
+              )}
+              {probe.status === "done" && probe.found.length > 0 && (
+                <>
+                  <select value={cfg.table || ""} style={selStyle}
+                    onChange={(e) => saveSettings({ ...settings, payplanSource: { table: e.target.value, nameCol: "", valueCol: "" } })}>
+                    <option value="">Choose a table…</option>
+                    {probe.found.map((f) => <option key={f.table} value={f.table}>{f.table} ({f.cols.length} columns)</option>)}
+                  </select>
+                  {cfgCols.length > 0 && (
+                    <>
+                      <span>Agent name:</span>
+                      <select value={cfg.nameCol || ""} style={selStyle}
+                        onChange={(e) => saveSettings({ ...settings, payplanSource: { ...cfg, nameCol: e.target.value } })}>
+                        <option value="">…</option>
+                        {cfgCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <span>Payplan amount:</span>
+                      <select value={cfg.valueCol || ""} style={selStyle}
+                        onChange={(e) => saveSettings({ ...settings, payplanSource: { ...cfg, valueCol: e.target.value } })}>
+                        <option value="">…</option>
+                        {cfgCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <span>Month (optional):</span>
+                      <select value={cfg.monthCol || ""} style={selStyle}
+                        onChange={(e) => saveSettings({ ...settings, payplanSource: { ...cfg, monthCol: e.target.value } })}>
+                        <option value="">(no month — one standing plan)</option>
+                        {cfgCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <span>Plan name (optional):</span>
+                      <select value={cfg.planNameCol || ""} style={selStyle}
+                        onChange={(e) => saveSettings({ ...settings, payplanSource: { ...cfg, planNameCol: e.target.value } })}>
+                        <option value="">(none)</option>
+                        {cfgCols.map((c) => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <button className="btn" onClick={loadStaff}>Load payplans</button>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+            {probe.status === "done" && probe.found.length > 0 && (
+              <p className="note">
+                Found: {probe.found.map((f) => f.table).join(", ")}. Columns in the chosen table:{" "}
+                <span className="mono">{cfgCols.join(", ") || "(pick a table)"}</span>
+              </p>
+            )}
+          </div>
+
           <div className="settings" style={{ marginBottom: 12 }}>
             <span>Financial year:</span>
             <select value={planYear} onChange={(e) => setPlanYear(Number(e.target.value))}
@@ -2351,7 +2542,10 @@ function Settings(props) {
                     const months = (settings.payplanMonthly || {})[planYear]?.[a2] || [];
                     const effective = MONTHS_FY.map((_, i) => {
                       const v = months[i];
-                      return v === "" || v == null ? (std === "" ? null : Number(std)) : Number(v);
+                      if (v !== "" && v != null) return Number(v);
+                      const fromDb = (staff.plansByMonth || {})[a2]?.[fyMonthKeys(planYear)[i]];
+                      if (fromDb != null) return Number(fromDb);
+                      return std === "" ? null : Number(std);
                     });
                     return (
                       <tr key={a2}>
@@ -2361,9 +2555,14 @@ function Settings(props) {
                             onChange={(e) => saveSettings({ ...settings, payplans: { ...payplans, [a2]: e.target.value === "" ? "" : Number(e.target.value) } })}
                             style={{ width: 90, padding: "4px 6px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 12, textAlign: "center" }} />
                         </td>
-                        {MONTHS_FY.map((_, i) => (
-                          <td key={i} className="num">
-                            <input type="number" value={months[i] ?? ""} placeholder={std === "" ? "-" : String(std)}
+                        {MONTHS_FY.map((_, i) => {
+                          const mk = fyMonthKeys(planYear)[i];
+                          const fromDb = (staff.plansByMonth || {})[a2]?.[mk];
+                          const planNm = (staff.planNames || {})[a2]?.[mk];
+                          return (
+                          <td key={i} className="num" title={planNm ? `Plan: ${planNm}` : undefined}>
+                            <input type="number" value={months[i] ?? ""}
+                              placeholder={fromDb != null ? String(fromDb) : (std === "" ? "-" : String(std))}
                               onChange={(e) => {
                                 const next = JSON.parse(JSON.stringify(settings.payplanMonthly || {}));
                                 next[planYear] = next[planYear] || {};
@@ -2373,8 +2572,10 @@ function Settings(props) {
                               }}
                               style={{ width: 74, padding: "4px 5px", border: "1px solid #e2e0ee", borderRadius: 5,
                                 fontSize: 12, textAlign: "center", background: months[i] == null || months[i] === "" ? "#faf9ff" : "#fff" }} />
+                            {planNm && <div className="sub" style={{ margin: 0, fontSize: 9.5 }}>{planNm}</div>}
                           </td>
-                        ))}
+                          );
+                        })}
                         <td className="num mono"><strong>{gbp(sum(effective.filter((v) => v != null)))}</strong></td>
                       </tr>
                     );
@@ -2462,31 +2663,39 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
 
   // ---- monthly series, for both GP and SOV ----
   const [mode, setMode] = useState("gp");
+
+  // financial years present across all three sources
+  const chartYears = useMemo(() => {
+    const set = new Set();
+    for (const r of [...ns, ...cb, ...s5]) { const f = fyStartOf(r.period); if (f) set.add(f); }
+    return [...set].sort((a, b) => b - a);
+  }, [ns, cb, s5]);
+  const [chartFy, setChartFy] = useState(null);
+  const cYear = chartFy ?? chartYears[0] ?? null;
+
+  // always 12 buckets: April through March
   const monthly = useMemo(() => {
-    const m = new Map();
-    const get = (p) => {
-      if (!m.has(p)) m.set(p, { p, nsGp: 0, cbPaid: 0, nsSov: 0, s5Sov: 0, cbSov: 0 });
-      return m.get(p);
-    };
+    if (cYear == null) return [];
+    const keys = fyMonthKeys(cYear);
+    const idx = new Map(keys.map((kk, i) => [kk, i]));
+    const rows = keys.map((p) => ({ p, nsGp: 0, cbPaid: 0, nsSov: 0, s5Sov: 0, cbSov: 0 }));
     for (const r of ns) {
-      if (!r.period) continue;
-      const e = get(r.period);
-      e.nsGp += r.expected || 0;
-      e.nsSov += r.sov || 0;                       // already Sales Closer rows only
+      const i = idx.get(r.period); if (i == null) continue;
+      rows[i].nsGp += r.expected || 0;
+      rows[i].nsSov += r.sov || 0;                 // Sales Closer rows only
     }
     for (const r of cb) {
-      if (!r.period) continue;
-      const e = get(r.period);
-      e.cbPaid += r.paid || 0;                     // Commission Paid
-      e.cbSov += r.sov || 0;                       // Contract Value
+      const i = idx.get(r.period); if (i == null) continue;
+      rows[i].cbPaid += r.paid || 0;               // Commission Paid
+      rows[i].cbSov += r.sov || 0;                 // Contract Value
     }
     for (const r of s5) {
-      if (!r.period) continue;
-      if (!isYes(r.orderFlag)) continue;           // only rows flagged Y
-      get(r.period).s5Sov += r.sov || 0;
+      const i = idx.get(r.period); if (i == null) continue;
+      if (!isYes(r.orderFlag)) continue;           // only rows flagged Y in "Sch5 Order"
+      rows[i].s5Sov += r.sov || 0;
     }
-    return [...m.values()].sort((a, b) => a.p.localeCompare(b.p)).slice(-12);
-  }, [ns, cb, s5]);
+    return rows;
+  }, [ns, cb, s5, cYear]);
 
   const flagCol = useMemo(() => s5.find((r) => r.orderFlagCol)?.orderFlagCol || null, [s5]);
 
@@ -2568,8 +2777,14 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
       <div className="two" style={{ marginTop: 14 }}>
         <div className="panel">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-            <h2 style={{ margin: 0 }}>Monthly {mode === "gp" ? "GP" : "SOV"} position</h2>
-            <div style={{ display: "flex", gap: 4 }}>
+            <h2 style={{ margin: 0 }}>
+              Monthly {mode === "gp" ? "GP" : "SOV"} position{cYear != null ? ` — ${fyLabel(cYear)}` : ""}
+            </h2>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <select value={cYear ?? ""} onChange={(e) => setChartFy(Number(e.target.value))}
+                style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 12.5 }}>
+                {chartYears.map((yy) => <option key={yy} value={yy}>{fyLabel(yy)}</option>)}
+              </select>
               {[["gp", "GP"], ["sov", "SOV"]].map(([v, l]) => (
                 <button key={v} className={"tab " + (mode === v ? "active" : "")}
                   style={{ padding: "5px 14px", fontSize: 12.5 }} onClick={() => setMode(v)}>{l}</button>
@@ -2599,7 +2814,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
                         width={Math.max(2, slot - 2)} height={h} fill={c} rx="1.5" />;
                     })}
                     <text x={padL + i * bw + bw / 2} y={H - 8} textAnchor="middle" fontSize="9" fill="#8a8aa3">
-                      {periodLabel(d.p)}
+                      {MONTHS_FY[i][1]}
                     </text>
                   </g>
                 ))}
