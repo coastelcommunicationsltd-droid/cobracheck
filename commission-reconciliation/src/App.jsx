@@ -2638,11 +2638,27 @@ function Settings(props) {
 function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) {
   const { ns, cb, s5 } = useSourceLines(files);
 
+  // financial years present across all three sources
+  const chartYears = useMemo(() => {
+    const set = new Set();
+    for (const r of [...ns, ...cb, ...s5]) { const f = fyStartOf(r.period); if (f) set.add(f); }
+    for (const r of records) { const f = fyStartOf(r.period); if (f) set.add(f); }
+    return [...set].sort((a, b) => b - a);
+  }, [ns, cb, s5, records]);
+  const [chartFy, setChartFy] = useState(null);
+  const cYear = chartFy ?? chartYears[0] ?? null;
+
+  // every figure on this page is for the selected financial year only
+  const recs = useMemo(
+    () => (cYear == null ? records : records.filter((r) => fyStartOf(r.period) === cYear)),
+    [records, cYear]
+  );
+
   // ---- headline position ----
   const k = useMemo(() => {
     let nsGp = 0, cobraPaymentCol = 0, cobraUnmatched = 0, sch5Unmatched = 0;
     let nMatched = 0, nReview = 0, nException = 0;
-    for (const r of records) {
+    for (const r of recs) {
       nsGp += r.expected || 0;
       cobraPaymentCol += r.recordedCobra || 0;              // NetSuite "Cobra Payment" column
       if (r.inCobra && !r.inNS) cobraUnmatched += r.paid || 0;   // C but not N
@@ -2659,19 +2675,10 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
       pctException: (nException / nTotal) * 100,
       nMatched, nReview, nException,
     };
-  }, [records]);
+  }, [recs]);
 
   // ---- monthly series, for both GP and SOV ----
   const [mode, setMode] = useState("gp");
-
-  // financial years present across all three sources
-  const chartYears = useMemo(() => {
-    const set = new Set();
-    for (const r of [...ns, ...cb, ...s5]) { const f = fyStartOf(r.period); if (f) set.add(f); }
-    return [...set].sort((a, b) => b - a);
-  }, [ns, cb, s5]);
-  const [chartFy, setChartFy] = useState(null);
-  const cYear = chartFy ?? chartYears[0] ?? null;
 
   // always 12 buckets: April through March
   const monthly = useMemo(() => {
@@ -2707,16 +2714,16 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
 
   // ---- exceptions needing action ----
   const exceptions = useMemo(() =>
-    records.filter((r) => r.flags.length)
+    recs.filter((r) => r.flags.length)
       .sort((a, b) => Math.max(0, ...b.flags.map((f) => f.sev)) - Math.max(0, ...a.flags.map((f) => f.sev)))
-      .slice(0, 8), [records]);
+      .slice(0, 8), [recs]);
 
   // ---- commission pay control ----
   const pay = useMemo(() => {
-    const btPaidUs = sum(records.map((r) => r.paid));
-    const entitled = sum(records.map((r) => r.netGp));
+    const btPaidUs = sum(recs.map((r) => r.paid));
+    const entitled = sum(recs.map((r) => r.netGp));
     return { btPaidUs, entitled };
-  }, [records]);
+  }, [recs]);
 
   const changes = useMemo(() => {
     if (!snapshot) return null;
@@ -2741,7 +2748,17 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
 
   return (
     <>
-      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, gap: 10, flexWrap: "wrap" }}>
+        <div className="settings" style={{ margin: 0 }}>
+          <span style={{ fontWeight: 600 }}>Financial year:</span>
+          <select value={cYear ?? ""} onChange={(e) => setChartFy(Number(e.target.value))}
+            style={{ padding: "7px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13.5, fontWeight: 600 }}>
+            {chartYears.map((yy) => <option key={yy} value={yy}>{fyLabel(yy)}</option>)}
+          </select>
+          <span className="sub" style={{ margin: 0 }}>
+            {cYear != null ? `Every figure on this page covers ${fyLabel(cYear)} only.` : "No dated rows yet."}
+          </span>
+        </div>
         <button className="btn" style={{ background: "#1e64d6", color: "#fff", padding: "9px 14px" }}
           onClick={() => saveSnapshot({
             at: new Date().toISOString(), received: k.nsGp, entitled: pay.entitled, nException: k.nException,
@@ -2780,11 +2797,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
             <h2 style={{ margin: 0 }}>
               Monthly {mode === "gp" ? "GP" : "SOV"} position{cYear != null ? ` — ${fyLabel(cYear)}` : ""}
             </h2>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              <select value={cYear ?? ""} onChange={(e) => setChartFy(Number(e.target.value))}
-                style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 12.5 }}>
-                {chartYears.map((yy) => <option key={yy} value={yy}>{fyLabel(yy)}</option>)}
-              </select>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
               {[["gp", "GP"], ["sov", "SOV"]].map(([v, l]) => (
                 <button key={v} className={"tab " + (mode === v ? "active" : "")}
                   style={{ padding: "5px 14px", fontSize: 12.5 }} onClick={() => setMode(v)}>{l}</button>
