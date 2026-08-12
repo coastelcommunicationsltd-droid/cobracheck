@@ -517,6 +517,30 @@ const STYLES = `
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .num { font-variant-numeric: tabular-nums; text-align:center; white-space:nowrap; }
 .wrap { max-width:100%; margin:0 auto; }
+.shell { display:flex; gap:0; align-items:stretch; min-height:100vh; margin:-16px -14px; }
+.sidebar { width:210px; flex:0 0 210px; background:#0b2050; color:#c9d4ee; padding:18px 12px; display:flex;
+  flex-direction:column; gap:4px; }
+.sidebar .brand { color:#fff; font-weight:800; font-size:14px; padding:4px 10px 14px; letter-spacing:-.01em; }
+.navi { display:flex; align-items:center; gap:9px; padding:10px 12px; border-radius:9px; cursor:pointer;
+  font-size:13.5px; font-weight:600; color:#c9d4ee; border:none; background:none; text-align:left; width:100%; }
+.navi:hover { background:#14306e; color:#fff; }
+.navi.on { background:#1e64d6; color:#fff; }
+.navi .ic { width:18px; text-align:center; font-size:14px; }
+.main { flex:1 1 auto; min-width:0; padding:16px 18px 40px; background:#f5f5fa; }
+.ptitle { font-size:23px; font-weight:800; letter-spacing:-.02em; margin:0 0 14px; color:#0b2050; }
+.kpis5 { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; }
+@media (max-width:1100px){ .kpis5 { grid-template-columns:repeat(2,1fr); } .sidebar{ width:64px; flex:0 0 64px; } .sidebar .lbl2, .sidebar .brand{ display:none; } }
+.kpic { background:#fff; border:1px solid #e7e6f0; border-top-width:3px; border-radius:12px; padding:14px; }
+.kpic .lab { font-size:12px; color:#5b5676; font-weight:600; }
+.kpic .val { font-size:21px; font-weight:800; margin-top:3px; letter-spacing:-.02em; }
+.kpic .sub2 { font-size:12px; font-weight:700; margin-top:1px; }
+.two { display:grid; grid-template-columns:1.55fr 1fr; gap:14px; align-items:start; }
+@media (max-width:1100px){ .two { grid-template-columns:1fr; } }
+.legend { display:flex; gap:14px; font-size:12px; color:#5b5676; margin-bottom:6px; flex-wrap:wrap; }
+.legend i { width:10px; height:10px; border-radius:3px; display:inline-block; margin-right:5px; }
+.step { display:flex; align-items:center; gap:8px; }
+.step .n { width:24px; height:24px; border-radius:50%; background:#1e64d6; color:#fff; font-size:12px;
+  font-weight:700; display:flex; align-items:center; justify-content:center; }
 .head { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:2px; }
 .head h1 { font-size:22px; margin:0; letter-spacing:-.02em; }
 .head .accent { color:#5514b4; }
@@ -622,7 +646,7 @@ export default function ReconciliationTool() {
   const [pass, setPass] = useState("");
   const [files, setFiles] = useState({ cobra: null, netsuite: null, sch5: null });
   const [errors, setErrors] = useState({});
-  const [tab, setTab] = useState("cross");
+  const [tab, setTab] = useState("overview");
   const [tol, setTol] = useState({ abs: 1, pct: 1 });
   const [expanded, setExpanded] = useState(new Set());
   const [session, setSession] = useState(null);
@@ -645,6 +669,8 @@ export default function ReconciliationTool() {
   const [staff, setStaff] = useState({ rows: [], status: "idle", planCol: null });
   // tracks which slots the user has replaced in this session, so a late DB read can't overwrite them
   const uploadedHere = useRef({});
+  const snapshot = settings.snapshot || null;
+  const saveSnapshot = useCallback((snap) => saveSettings({ ...settings, snapshot: snap }), [settings, saveSettings]);
 
   const EXCLUDED_MANAGER = "tracy webber";
 
@@ -936,6 +962,18 @@ export default function ReconciliationTool() {
     );
   }
 
+  const NAV = [
+    ["overview", "Overview", "◴"],
+    ["cross", "Cross-Reference", "⇄"],
+    ["wip", "Cobra Dashboard", "▦"],
+    ["agents", "Commission", "◫"],
+    ["btpay", "BT Payments", "£"],
+    ["exceptions", "Exceptions", "⚠"],
+    ["obi", "OBI Checks", "☑"],
+    ["reconcile", "Reconciliation", "⚖"],
+    ["settings", "Settings", "⚙"],
+  ];
+
   const TABS = [
     ["cross", "Cross-Reference"],
     ["wip", "Cobra Dashboard"],
@@ -950,10 +988,22 @@ export default function ReconciliationTool() {
   return (
     <div className="recon">
       <style>{STYLES}</style>
-      <div className="wrap">
+      <div className="shell">
+        <nav className="sidebar">
+          <div className="brand">BT Payment &amp;<br />Commission Recon</div>
+          {NAV.map(([k, l, ic]) => (
+            <button key={k} className={"navi " + (tab === k ? "on" : "")} onClick={() => setTab(k)}>
+              <span className="ic">{ic}</span><span className="lbl2">{l}</span>
+            </button>
+          ))}
+          <div style={{ marginTop: "auto", fontSize: 11, color: "#7f92c4", padding: "10px" }} className="lbl2">
+            {snapshot?.at ? <>Snapshot<br />{new Date(snapshot.at).toLocaleDateString("en-GB")}</> : "No snapshot yet"}
+          </div>
+        </nav>
+        <div className="main">
         <div className="head">
-          <h1>Commission <span className="accent">Reconciliation</span></h1>
-          <span className="sub" style={{ margin: 0 }}>Cobra · NetSuite · Sch5 — shared <span className="mono" style={{ opacity: .6 }}>({APP_VERSION})</span></span>
+          <h1 className="ptitle" style={{ margin: 0 }}>BT Payment &amp; Commission Reconciliation</h1>
+          <span className="sub" style={{ margin: 0 }}><span className="mono" style={{ opacity: .6 }}>({APP_VERSION})</span></span>
           {session && (
             <span className="sub" style={{ marginLeft: "auto" }}>
               {session.user?.email}{" · "}
@@ -1017,12 +1067,6 @@ export default function ReconciliationTool() {
           </div>
         )}
 
-        {/* top bar */}
-        <div className="tabs">
-          {TABS.map(([k, l]) => (
-            <button key={k} className={"tab " + (tab === k ? "active" : "")} onClick={() => setTab(k)}>{l}</button>
-          ))}
-        </div>
 
         {tab === "settings" && (
           <Settings
@@ -1036,12 +1080,17 @@ export default function ReconciliationTool() {
           />
         )}
 
-        {tab !== "settings" && !anyLoaded && (
+        {tab !== "settings" && tab !== "overview" && !anyLoaded && (
           <div className="empty panel">No data loaded yet. Open <strong>Settings → Raw Data</strong> to upload the three exports.</div>
         )}
 
-        {tab !== "settings" && anyLoaded && (
+        {tab !== "settings" && (anyLoaded || tab === "overview") && (
           <>
+            {tab === "overview" && (
+              <Overview records={result.records} files={files} settings={settings}
+                snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab} />
+            )}
+
             {tab === "cross" && <CrossReference records={result.records} settings={settings} />}
 
             {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
@@ -1182,6 +1231,7 @@ export default function ReconciliationTool() {
         <p className="note" style={{ textAlign: "center", marginTop: 20 }}>
           Access is limited to the emails in the Users list. Real commission data is stored in Supabase, protected by that list.
         </p>
+        </div>
       </div>
     </div>
   );
@@ -2371,5 +2421,274 @@ function Settings(props) {
         </div>
       )}
     </>
+  );
+}
+
+// =========================================================================
+//  Overview — the landing page
+// =========================================================================
+function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) {
+  const { ns, cb } = useSourceLines(files);
+
+  // ---- headline position ----
+  const k = useMemo(() => {
+    let received = 0, matched = 0, underpaid = 0, overpaid = 0, unallocated = 0;
+    let nMatched = 0, nReview = 0, nException = 0;
+    for (const r of records) {
+      const paid = r.paid || 0, exp = r.expected || 0;
+      received += paid;
+      if (r.inCobra && !r.inNS) { unallocated += paid; nException++; continue; }
+      if (!r.inCobra) { if (r.flags.some((f) => f.sev === 3)) nException++; continue; }
+      const d = paid - exp;
+      if (Math.abs(d) < 0.005) { matched += paid; nMatched++; }
+      else if (d < 0) { underpaid += -d; nReview++; }
+      else { overpaid += d; nReview++; }
+      if (r.flags.some((f) => f.sev === 3)) { nException++; nReview--; }
+    }
+    const nTotal = Math.max(1, nMatched + nReview + nException);
+    return {
+      received, matched, underpaid, overpaid, unallocated,
+      pctMatched: (nMatched / nTotal) * 100,
+      pctReview: (Math.max(0, nReview) / nTotal) * 100,
+      pctException: (nException / nTotal) * 100,
+      nMatched, nReview: Math.max(0, nReview), nException,
+    };
+  }, [records]);
+
+  // ---- monthly position: expected vs what NetSuite says Cobra paid vs what Cobra actually paid ----
+  const monthly = useMemo(() => {
+    const m = new Map();
+    const get = (p) => {
+      if (!m.has(p)) m.set(p, { p, nsGp: 0, nsPay: 0, cbPay: 0 });
+      return m.get(p);
+    };
+    const seen = new Set();
+    for (const r of ns) {
+      if (!r.period) continue;
+      const e = get(r.period);
+      e.nsGp += r.expected || 0;
+      const dk = String(r.docNo ?? r.orderNum ?? "");
+      if (r.recordedCobra != null && !seen.has(dk)) { seen.add(dk); e.nsPay += r.recordedCobra; }
+    }
+    for (const r of cb) { if (r.period) get(r.period).cbPay += r.paid || 0; }
+    return [...m.values()].sort((a, b) => a.p.localeCompare(b.p)).slice(-12);
+  }, [ns, cb]);
+
+  const maxY = Math.max(1, ...monthly.flatMap((d) => [d.nsGp, d.nsPay, d.cbPay]));
+  const niceMax = Math.ceil(maxY / 50000) * 50000 || maxY;
+
+  // ---- exceptions needing action ----
+  const exceptions = useMemo(() =>
+    records.filter((r) => r.flags.length)
+      .sort((a, b) => Math.max(0, ...b.flags.map((f) => f.sev)) - Math.max(0, ...a.flags.map((f) => f.sev)))
+      .slice(0, 8), [records]);
+
+  // ---- commission pay control ----
+  const pay = useMemo(() => {
+    const btPaidUs = sum(records.map((r) => r.paid));
+    const entitled = sum(records.map((r) => r.netGp));
+    return { btPaidUs, entitled };
+  }, [records]);
+
+  const changes = useMemo(() => {
+    if (!snapshot) return null;
+    return {
+      received: k.received - (snapshot.received || 0),
+      entitled: pay.entitled - (snapshot.entitled || 0),
+      exceptions: k.nException - (snapshot.nException || 0),
+    };
+  }, [snapshot, k, pay]);
+
+  const W = 640, H = 230, padL = 46, padB = 26, padT = 8;
+  const bw = monthly.length ? (W - padL - 8) / monthly.length : 0;
+  const y = (v) => padT + (H - padT - padB) * (1 - v / niceMax);
+  const SERIES = [["nsGp", "#1e64d6", "NetSuite GP"], ["nsPay", "#12a594", "NetSuite → Cobra"], ["cbPay", "#8b5cf6", "Cobra paid"]];
+
+  const Card = ({ colour, label, value, sub2, subColour }) => (
+    <div className="kpic" style={{ borderTopColor: colour }}>
+      <div className="lab">{label}</div>
+      <div className="val" style={{ color: colour }}>{value}</div>
+      {sub2 && <div className="sub2" style={{ color: subColour || colour }}>{sub2}</div>}
+    </div>
+  );
+
+  return (
+    <>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+        <button className="btn" style={{ background: "#1e64d6", color: "#fff", padding: "9px 14px" }}
+          onClick={() => saveSnapshot({
+            at: new Date().toISOString(), received: k.received, entitled: pay.entitled, nException: k.nException,
+          })}>
+          {snapshot?.at ? `Re-lock snapshot (last ${new Date(snapshot.at).toLocaleDateString("en-GB")})` : "Lock snapshot"}
+        </button>
+      </div>
+
+      <div className="kpis5">
+        <Card colour="#1e64d6" label="BT Payments Received" value={gbp0(k.received)} />
+        <Card colour="#14804a" label="Matched" value={gbp0(k.matched)} sub2={k.pctMatched.toFixed(1) + "%"} />
+        <Card colour="#d98a00" label="Underpaid" value={gbp0(k.underpaid)} />
+        <Card colour="#b3261e" label="Overpaid" value={gbp0(k.overpaid)} />
+        <Card colour="#5b6472" label="Unallocated" value={gbp0(k.unallocated)} />
+      </div>
+
+      <div className="two" style={{ marginTop: 14 }}>
+        <div className="panel">
+          <h2>Monthly payment position</h2>
+          <div className="legend">
+            {SERIES.map(([kk, c, l]) => <span key={kk}><i style={{ background: c }} />{l}</span>)}
+          </div>
+          {monthly.length === 0 ? <div className="empty">No dated rows yet.</div> : (
+            <div style={{ overflowX: "auto" }}>
+              <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 520, height: 240 }}>
+                {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+                  <g key={f}>
+                    <line x1={padL} x2={W - 4} y1={y(niceMax * f)} y2={y(niceMax * f)} stroke="#eceaf4" />
+                    <text x={padL - 6} y={y(niceMax * f) + 3} textAnchor="end" fontSize="9" fill="#8a8aa3">
+                      {Math.round((niceMax * f) / 1000)}K
+                    </text>
+                  </g>
+                ))}
+                {monthly.map((d, i) => (
+                  <g key={d.p}>
+                    {SERIES.map(([kk, c], j) => {
+                      const h = Math.max(0, y(0) - y(d[kk]));
+                      return <rect key={kk} x={padL + i * bw + j * (bw / 3.6) + 3} y={y(d[kk])}
+                        width={Math.max(2, bw / 4.2)} height={h} fill={c} rx="1.5" />;
+                    })}
+                    <text x={padL + i * bw + bw / 2} y={H - 8} textAnchor="middle" fontSize="9" fill="#8a8aa3">
+                      {periodLabel(d.p)}
+                    </text>
+                  </g>
+                ))}
+              </svg>
+            </div>
+          )}
+        </div>
+
+        <div className="panel">
+          <h2>Reconciliation status</h2>
+          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            <Donut matched={k.pctMatched} review={k.pctReview} exception={k.pctException} />
+            <div style={{ fontSize: 13 }}>
+              {[["Matched", k.pctMatched, "#14804a", k.nMatched],
+                ["Review", k.pctReview, "#d98a00", k.nReview],
+                ["Exception", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
+                <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                  <i style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
+                  <span style={{ minWidth: 78 }}>{l}</span>
+                  <strong className="mono">{v.toFixed(1)}%</strong>
+                  <span className="sub" style={{ margin: 0 }}>({n})</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="two" style={{ marginTop: 14 }}>
+        <div className="panel">
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <h2 style={{ margin: 0 }}>Exceptions requiring action</h2>
+            <button className="btn" onClick={() => setTab("exceptions")}>View all →</button>
+          </div>
+          {exceptions.length === 0 ? <div className="empty">Nothing flagged.</div> : (
+            <div style={{ overflowX: "auto", marginTop: 10 }}>
+              <table>
+                <thead><tr>
+                  <th className="left">Order</th><th className="left">Company</th>
+                  <th className="num">NetSuite</th><th className="num">Cobra</th>
+                  <th className="num">Variance</th><th className="left">Reason</th>
+                </tr></thead>
+                <tbody>
+                  {exceptions.map((r) => {
+                    const v = (r.paid || 0) - (r.expected || 0);
+                    const top = r.flags[0];
+                    return (
+                      <tr key={r.key}>
+                        <td className="left mono">{r.orderNum || "-"}</td>
+                        <td className="left">{r.company}</td>
+                        <td className="num mono">{r.inNS ? gbp(r.expected) : "-"}</td>
+                        <td className="num mono">{r.inCobra ? gbp(r.paid) : "-"}</td>
+                        <td className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>
+                          {r.inNS && r.inCobra ? gbp(v) : "-"}
+                        </td>
+                        <td className="left">
+                          <span className={"chip " + (top.sev === 3 ? "risk" : top.sev === 2 ? "mismatch" : "unmatched")}>
+                            {top.code.replace(/_/g, " ").toLowerCase()}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <div>
+          <div className="panel">
+            <h2>Commission pay control</h2>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 8 }}>
+              <div className="step"><span className="n">1</span>
+                <div><div className="sub" style={{ margin: 0 }}>BT paid us</div>
+                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.btPaidUs)}</strong></div>
+              </div>
+              <span style={{ color: "#c9c6da" }}>›</span>
+              <div className="step"><span className="n">2</span>
+                <div><div className="sub" style={{ margin: 0 }}>Agents entitled</div>
+                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.entitled)}</strong></div>
+              </div>
+            </div>
+            <p className="note">
+              Entitled = Net GP (excludes Red GP statuses and non-commissionable lines).
+              A third step — what we actually paid out — needs a payroll figure; see the note below.
+            </p>
+          </div>
+
+          <div className="panel">
+            <h2>Changes since snapshot</h2>
+            {!snapshot ? (
+              <div className="empty" style={{ padding: 20 }}>No snapshot locked yet. Lock one to start tracking movement.</div>
+            ) : (
+              <table>
+                <tbody>
+                  <tr><td className="left">BT payments received</td>
+                    <td className={"num mono " + (changes.received >= 0 ? "pos" : "neg")}>{gbp0(changes.received)}</td></tr>
+                  <tr><td className="left">Agents entitled</td>
+                    <td className={"num mono " + (changes.entitled >= 0 ? "pos" : "neg")}>{gbp0(changes.entitled)}</td></tr>
+                  <tr><td className="left">Open exceptions</td>
+                    <td className={"num mono " + (changes.exceptions <= 0 ? "pos" : "neg")}>
+                      {changes.exceptions > 0 ? "+" : ""}{changes.exceptions}</td></tr>
+                </tbody>
+              </table>
+            )}
+            {snapshot && <p className="note">Locked {new Date(snapshot.at).toLocaleString("en-GB")}.</p>}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function Donut({ matched, review, exception }) {
+  const R = 54, r = 34, C = 2 * Math.PI * ((R + r) / 2), sw = R - r;
+  const segs = [[matched, "#14804a"], [review, "#d98a00"], [exception, "#b3261e"]];
+  let offset = 0;
+  return (
+    <svg viewBox="0 0 120 120" style={{ width: 130, height: 130 }}>
+      <circle cx="60" cy="60" r={(R + r) / 2} fill="none" stroke="#eceaf4" strokeWidth={sw} />
+      {segs.map(([v, c], i) => {
+        const len = (Math.max(0, v) / 100) * C;
+        const el = <circle key={i} cx="60" cy="60" r={(R + r) / 2} fill="none" stroke={c} strokeWidth={sw}
+          strokeDasharray={`${len} ${C - len}`} strokeDashoffset={-offset} transform="rotate(-90 60 60)" />;
+        offset += len;
+        return el;
+      })}
+      <text x="60" y="58" textAnchor="middle" fontSize="17" fontWeight="800" fill="#1b1636">
+        {matched.toFixed(0)}%
+      </text>
+      <text x="60" y="72" textAnchor="middle" fontSize="8.5" fill="#8a8aa3">matched</text>
+    </svg>
   );
 }
