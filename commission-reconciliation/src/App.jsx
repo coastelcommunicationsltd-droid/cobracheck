@@ -15,7 +15,7 @@ import { createClient } from "@supabase/supabase-js";
 // protection is the login + the email allow-list you set up in the SQL step.
 // The URL below is already your existing project; just paste the anon key.
 const SUPABASE_URL = "https://xrekebgnubhjqtpllbcz.supabase.co";
-const SUPABASE_ANON_KEY = "PASTE-YOUR-ANON-KEY-HERE";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhyZWtlYmdudWJoanF0cGxsYmN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MDEyNDMsImV4cCI6MjEwMDk3NzI0M30.1MbG2AX63hFNvzZoZB56pjkOlW6Dq7s4U5mGaaJGi80";
 // ==========================================================
 
 const supabase =
