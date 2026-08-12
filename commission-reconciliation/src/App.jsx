@@ -527,19 +527,21 @@ const STYLES = `
 .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .num { font-variant-numeric: tabular-nums; text-align:center; white-space:nowrap; }
 .wrap { max-width:100%; margin:0 auto; }
-.shell { display:flex; gap:0; align-items:stretch; min-height:100vh; margin:-16px -14px; }
-.sidebar { width:210px; flex:0 0 210px; background:#0b2050; color:#c9d4ee; padding:18px 12px; display:flex;
-  flex-direction:column; gap:4px; }
-.sidebar .brand { color:#fff; font-weight:800; font-size:14px; padding:4px 10px 14px; letter-spacing:-.01em; }
-.navi { display:flex; align-items:center; gap:9px; padding:10px 12px; border-radius:9px; cursor:pointer;
-  font-size:13.5px; font-weight:600; color:#c9d4ee; border:none; background:none; text-align:left; width:100%; }
-.navi:hover { background:#14306e; color:#fff; }
-.navi.on { background:#1e64d6; color:#fff; }
-.navi .ic { width:18px; text-align:center; font-size:14px; }
+.shell { display:flex; flex-direction:column; min-height:100vh; margin:-16px -14px; }
+.sidebar { background:#0b2050; color:#c9d4ee; padding:0 14px; display:flex; flex-direction:row;
+  align-items:center; gap:2px; flex-wrap:wrap; }
+.sidebar .brand { color:#fff; font-weight:800; font-size:13.5px; padding:12px 16px 12px 4px;
+  letter-spacing:-.01em; margin-right:8px; white-space:nowrap; }
+.navi { display:inline-flex; align-items:center; gap:7px; padding:14px 13px; cursor:pointer;
+  font-size:13px; font-weight:600; color:#c9d4ee; border:none; background:none; white-space:nowrap;
+  border-bottom:3px solid transparent; }
+.navi:hover { color:#fff; background:#14306e; }
+.navi.on { color:#fff; border-bottom-color:#4f9bff; background:#14306e; }
+.navi .ic { font-size:13px; }
 .main { flex:1 1 auto; min-width:0; padding:16px 18px 40px; background:#f5f5fa; }
 .ptitle { font-size:23px; font-weight:800; letter-spacing:-.02em; margin:0 0 14px; color:#0b2050; }
 .kpis5 { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; }
-@media (max-width:1100px){ .kpis5 { grid-template-columns:repeat(2,1fr); } .sidebar{ width:64px; flex:0 0 64px; } .sidebar .lbl2, .sidebar .brand{ display:none; } }
+@media (max-width:1100px){ .kpis5 { grid-template-columns:repeat(2,1fr); } }
 .kpic { background:#fff; border:1px solid #e7e6f0; border-top-width:3px; border-radius:12px; padding:14px; }
 .kpic .lab { font-size:12px; color:#5b5676; font-weight:600; }
 .kpic .val { font-size:21px; font-weight:800; margin-top:3px; letter-spacing:-.02em; }
@@ -753,6 +755,23 @@ export default function ReconciliationTool() {
 
   useEffect(() => { loadStaff(); }, [loadStaff]);
 
+  // status_config drives how each order status is treated (its "tone" column)
+  const [statusConfig, setStatusConfig] = useState({ rows: [], status: "idle", cols: {} });
+  useEffect(() => {
+    if (!supabase || !session) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase.from("status_config").select("*");
+      if (cancelled) return;
+      if (error || !data || !data.length) { setStatusConfig({ rows: [], status: "error", cols: {} }); return; }
+      const cols = Object.keys(data[0]);
+      const nameCol = cols.find((c) => /^status$/i.test(c)) || cols.find((c) => /status|name|label/i.test(c));
+      const toneCol = cols.find((c) => /^tone$/i.test(c)) || cols.find((c) => /tone|type|category/i.test(c));
+      setStatusConfig({ rows: data, status: "ok", cols: { nameCol, toneCol } });
+    })();
+    return () => { cancelled = true; };
+  }, [session]);
+
   // order statuses as used by SchThrive WebOS (same database, read-only)
   const [webosStatuses, setWebosStatuses] = useState({ list: [], status: "idle" });
   useEffect(() => {
@@ -774,6 +793,21 @@ export default function ReconciliationTool() {
     })();
     return () => { cancelled = true; };
   }, [session]);
+
+  const staffManagers = useMemo(() => {
+    if (!staff.rows.length) return {};
+    const cols = Object.keys(staff.rows[0]);
+    const nameCol = cols.find((c) => /^(name|full_?name|agent)$/i.test(c)) || cols.find((c) => /name/i.test(c) && !/manager/i.test(c));
+    const mgrCol = cols.find((c) => /^manager_?name$/i.test(c)) || cols.find((c) => /manager/i.test(c) && /name/i.test(c))
+      || cols.find((c) => /^team$/i.test(c));
+    if (!nameCol || !mgrCol) return {};
+    const out = {};
+    for (const r of staff.rows) {
+      const n = String(r[nameCol] || "").trim();
+      if (n) out[n] = String(r[mgrCol] || "").trim();
+    }
+    return out;
+  }, [staff]);
 
   const staffNames = useMemo(() => {
     const nameCol = staff.rows.length
@@ -913,7 +947,21 @@ export default function ReconciliationTool() {
     }
   }, [saveShared]);
 
-  const result = useMemo(() => reconcile(files, tol, period, settings.risk || {}), [files, tol, period, settings.risk]);
+  // status_config (tone column) is the base; anything set by hand in Settings overrides it
+  const effectiveStatusRules = useMemo(() => {
+    const out = {};
+    const { nameCol, toneCol } = statusConfig.cols || {};
+    if (nameCol && toneCol) {
+      for (const r of statusConfig.rows) {
+        const nm = String(r[nameCol] || "").trim();
+        const t = toneToTreatment(r[toneCol]);
+        if (nm && t) out[nm] = t;
+      }
+    }
+    return { ...out, ...(settings.risk || {}) };
+  }, [statusConfig, settings.risk]);
+
+  const result = useMemo(() => reconcile(files, tol, period, effectiveStatusRules), [files, tol, period, effectiveStatusRules]);
   const anyLoaded = files.cobra || files.netsuite || files.sch5;
   const allLoaded = files.cobra && files.netsuite && files.sch5;
 
@@ -1020,11 +1068,12 @@ export default function ReconciliationTool() {
     ["overview", "Overview", "◴"],
     ["cross", "Cross-Reference", "⇄"],
     ["wip", "Cobra Dashboard", "▦"],
-    ["agents", "Commission", "◫"],
+    ["agents", "Payroll", "◫"],
     ["btpay", "BT Payments", "£"],
     ["exceptions", "Exceptions", "⚠"],
     ["obi", "OBI Checks", "☑"],
     ["reconcile", "Reconciliation", "⚖"],
+    ["monthly", "Monthly Reports", "🗓"],
     ["settings", "Settings", "⚙"],
   ];
 
@@ -1044,19 +1093,19 @@ export default function ReconciliationTool() {
       <style>{STYLES}</style>
       <div className="shell">
         <nav className="sidebar">
-          <div className="brand">BT Payment &amp;<br />Commission Recon</div>
+          <div className="brand">BT Payment &amp; Commission Reconciliation</div>
           {NAV.map(([k, l, ic]) => (
             <button key={k} className={"navi " + (tab === k ? "on" : "")} onClick={() => setTab(k)}>
               <span className="ic">{ic}</span><span className="lbl2">{l}</span>
             </button>
           ))}
-          <div style={{ marginTop: "auto", fontSize: 11, color: "#7f92c4", padding: "10px" }} className="lbl2">
-            {snapshot?.at ? <>Snapshot<br />{new Date(snapshot.at).toLocaleDateString("en-GB")}</> : "No snapshot yet"}
+          <div style={{ marginLeft: "auto", fontSize: 11, color: "#7f92c4", paddingRight: 4 }}>
+            {snapshot?.at ? `Snapshot ${new Date(snapshot.at).toLocaleDateString("en-GB")}` : "No snapshot"}
           </div>
         </nav>
         <div className="main">
         <div className="head">
-          <h1 className="ptitle" style={{ margin: 0 }}>BT Payment &amp; Commission Reconciliation</h1>
+          <h1 className="ptitle" style={{ margin: 0 }}>{(NAV.find(([kk]) => kk === tab) || [,"Overview"])[1]}</h1>
           <span className="sub" style={{ margin: 0 }}><span className="mono" style={{ opacity: .6 }}>({APP_VERSION})</span></span>
           {session && (
             <span className="sub" style={{ marginLeft: "auto" }}>
@@ -1129,8 +1178,8 @@ export default function ReconciliationTool() {
             isAdmin={isAdmin} users={users} newUser={newUser} setNewUser={setNewUser}
             addUser={addUser} removeUser={removeUser} userMsg={userMsg}
             settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
-            records={result.records} staffNames={staffNames} staff={staff} loadStaff={loadStaff}
-            webosStatuses={webosStatuses} probe={probe} probeTables={probeTables}
+            records={result.records} staffNames={staffNames} staff={staff} loadStaff={loadStaff} managers={staffManagers}
+            webosStatuses={webosStatuses} probe={probe} probeTables={probeTables} statusConfig={statusConfig}
           />
         )}
 
@@ -1145,12 +1194,18 @@ export default function ReconciliationTool() {
                 snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab} />
             )}
 
-            {tab === "cross" && <CrossReference records={result.records} settings={settings} />}
+            {tab === "monthly" && (
+              <MonthlyReports supabase={supabase} session={session} files={files}
+                statusRules={effectiveStatusRules} />
+            )}
 
-            {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
+            {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
+
+            {tab === "wip" && <WipTracker files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
 
             {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
-              dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}} />}
+              dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}}
+              managers={staffManagers} statusRules={effectiveStatusRules} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -1854,7 +1909,8 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
   const rowVals = (rowKey) => keys.map((_, i) => getM(rowKey, i));
   const netOrig = rowVals("netOriginal");
   const origPayroll = rowVals("originalPayroll");
-  const latestPayroll = rowVals("latestPayroll");
+  // "Latest Payroll GP" is no longer typed in: it now follows payable GP (statuses that count).
+  const latestPayroll = rep.latestStats;
   const pillar = rowVals("pillar");
   const accUplift = rowVals("accUplift");
 
@@ -1988,12 +2044,10 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
             <tbody>
               <Row label="Net Original stats GP" tag="Manual" kind="input" rowKey="netOriginal" vals={netOrig} />
               <Row label="Original Payroll stats GP" tag="Manual" kind="input" rowKey="originalPayroll" vals={origPayroll} />
-              <Row label="Latest Payroll GP" tag="Manual" kind="input" rowKey="latestPayroll" vals={latestPayroll} />
               <Row group label="Net Vs Latest Diff" tag="Formula" vals={netVsLatest} danger={(v) => v > 0} />
               <Row group label="Latest stats" tag="Report" vals={rep.latestStats} />
               <Row label="Latest Paid on Cobra" tag="Report" vals={rep.paidCobra} />
               <Row label="O/S unpaid WIP" tag="Report" vals={rep.unpaidWip} />
-              <Row label="Red GP (not counted)" tag="Report" vals={rep.redGp} danger={(v) => v > 0} />
               <Row group label="Pillar Bonus & Incentives" tag="Manual" kind="input" rowKey="pillar" vals={pillar} />
               <Row label="Accelerator Uplift" tag="Manual" kind="input" rowKey="accUplift" vals={accUplift} />
               <Row group label="Change From Original to Payroll" tag="Formula" kind="pct" vals={changeToPayroll} />
@@ -2017,6 +2071,8 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           Net Vs Latest Diff = Net Original − Latest stats · Change in Value = Net Original − Latest Payroll ·
           How Much Cancelled = Net Vs Latest Diff ÷ Net Original · How much has been paid = Paid on Cobra ÷ Latest stats ·
           Overage = Paid on Cobra − Latest stats.
+          <br /><strong>Note:</strong> "Latest Payroll GP" is no longer typed in — it now follows payable GP
+          (everything except Red GP statuses), which is what feeds "Change From Original to Payroll" and "Change in Value".
         </p>
       </div>
 
@@ -2027,7 +2083,6 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
           let list = [];
           const counted = (r) => statusCounts(statusSettings, r.status) && !isNonCommissionable(r);
           if (drill.label === "Latest stats") list = inMonth.filter(counted);
-          else if (drill.label === "Red GP (not counted)") list = inMonth.filter((r) => !counted(r));
           else if (drill.label === "O/S unpaid WIP") list = inMonth.filter((r) => counted(r) && (r.itemPaid != null ? !isYes(r.itemPaid) : !r.statusPaid));
           else if (drill.label === "Latest Paid on Cobra") list = inMonth.filter((r) => {
             if (r.recordedCobra == null) return false;
@@ -2090,7 +2145,8 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
-function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {}, dbPlansByMonth = {}, dbPlanNames = {} }) {
+function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {}, dbPlansByMonth = {}, dbPlanNames = {},
+  managers = {}, statusRules = {} }) {
   const monthlyPlans = settings.payplanMonthly || {};
   const { ns, cb } = useSourceLines(files);
   const [basis, setBasis] = useState("earned");
@@ -2119,17 +2175,27 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const i = idx.get(r.period);
       if (i == null) continue;
       const name = r.partner || r.agent || "(unassigned)";   // GP is credited to the Partner
-      if (!m.has(name)) m.set(name, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
+      if (!m.has(name)) m.set(name, { earned: keys.map(() => 0), payable: keys.map(() => 0), other: keys.map(() => 0), paid: keys.map(() => 0) });
       const g = m.get(name);
-      g.earned[i] += r.expected || 0;
+      const gp = r.expected || 0;
+      g.earned[i] += gp;
+      if (statusCounts(statusRules, r.status) && !isNonCommissionable(r)) g.payable[i] += gp;
+      else g.other[i] += gp;
       g.paid[i] += paidByOrder.get(r.orderNum) || 0;
     }
-    for (const n of staffNames) if (!m.has(n)) m.set(n, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
+    for (const n of staffNames) if (!m.has(n)) m.set(n, { earned: keys.map(() => 0), payable: keys.map(() => 0), other: keys.map(() => 0), paid: keys.map(() => 0) });
     // if we have a staff list, only show those people (drops Office Doublecount, ex-staff, Tracy's team)
     const allow = new Set(staffNames.map((n) => n.toLowerCase()));
     const out = [...m.entries()].filter(([n]) => !staffNames.length || allow.has(n.toLowerCase()));
-    return out.sort((a, b) => sum(b[1].earned) - sum(a[1].earned));
-  }, [ns, idx, paidByOrder, keys.join(), staffNames.join()]);
+    return out.sort((a, b) => a[0].localeCompare(b[0]));   // alphabetical
+  }, [ns, idx, paidByOrder, keys.join(), staffNames.join(), statusRules]);
+
+  // manager filter
+  const [mgr, setMgr] = useState("all");
+  const managerList = useMemo(
+    () => [...new Set(Object.values(managers).filter(Boolean))].sort(), [managers]);
+  const shownAgents = useMemo(
+    () => agents.filter(([n]) => mgr === "all" || (managers[n] || "") === mgr), [agents, mgr, managers]);
 
   const payplans = { ...dbPlans, ...(settings.payplans || {}) };   // manual overrides win
   const paidMarks = settings.paidMarks || {};
@@ -2159,11 +2225,11 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
   // paid in a month where the agent didn't reach their target
   const breaches = useMemo(() => {
     const out = [];
-    for (const [name, g] of agents) {
+    for (const [name, g] of shownAgents) {
       keys.forEach((mk, i) => {
         const target = planFor(name, i);
         if (!(target > 0)) return;
-        const earned = g.earned[i] || 0;
+        const earned = g.payable[i] || 0;
         const paidOut = g.paid[i] || 0;
         const marked = isMarkedPaid(name, i);
         if (earned < target && (paidOut > 0 || marked)) {
@@ -2172,7 +2238,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       });
     }
     return out.sort((a, b) => b.shortfall - a.shortfall);
-  }, [agents, keys.join(), monthlyPlans, payplans, dbPlansByMonth, paidMarks]);
+  }, [shownAgents, keys.join(), monthlyPlans, payplans, dbPlansByMonth, paidMarks]);
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
 
@@ -2187,16 +2253,26 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
           </select>
           <span style={{ width: 12 }} />
+          <span>Manager:</span>
+          <select value={mgr} onChange={(e) => setMgr(e.target.value)}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            <option value="all">All managers</option>
+            {managerList.map((mm) => <option key={mm} value={mm}>{mm}</option>)}
+          </select>
+          <span style={{ width: 12 }} />
           <span>Show:</span>
           <select value={basis} onChange={(e) => setBasis(e.target.value)}
             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
-            <option value="earned">Commission earned (NetSuite GP)</option>
-            <option value="paid">Commission paid (Cobra)</option>
+            <option value="earned">Total GP</option>
+            <option value="payable">Payable GP only</option>
+            <option value="other">Other GP only</option>
+            <option value="paid">Paid on Cobra</option>
           </select>
         </div>
       </div>
       <p className="note" style={{ marginTop: 6 }}>
-        Red = below that agent's target for the month. Targets come from the database where available, and can be
+        Each cell shows <strong>Total GP</strong>, with <span style={{ color: "#14804a" }}>payable</span> and
+        <span style={{ color: "#8a8aa3" }}> other</span> beneath it. Red = below that agent's target for the month. Targets come from the database where available, and can be
         overridden in Settings → Payplans. Tick a cell to mark the agent paid for that month.
       </p>
 
@@ -2239,14 +2315,17 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             </tr>
           </thead>
           <tbody>
-            {agents.map(([name, g]) => {
-              const vals = basis === "earned" ? g.earned : g.paid;
+            {shownAgents.map(([name, g]) => {
+              const vals = g[basis] || g.earned;
               return (
                 <tr key={name}>
-                  <td className="left">{name}</td>
+                  <td className="left">
+                    {name}
+                    {managers[name] && <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{managers[name]}</div>}
+                  </td>
                   <td className="num mono">{payplans[name] ?? dbPlans[name] ? gbp(Number(payplans[name] ?? dbPlans[name])) : "-"}</td>
                   {vals.map((v, i) => {
-                    const bad = below(name, v, i);
+                    const bad = below(name, g.payable[i] || 0, i);
                     const plan = planFor(name, i);
                     const marked = isMarkedPaid(name, i);
                     return (
@@ -2255,8 +2334,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                             : bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
                           color: bad ? "#b3261e" : undefined,
                           outline: bad && (marked || (g.paid[i] || 0) > 0) ? "2px solid #b3261e" : undefined }}>
-                        <div>{v ? gbp(v) : "-"}</div>
-                        {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp(plan)}</div>}
+                        {basis === "earned" ? (
+                          <>
+                            <div><strong>{v ? gbp0(v) : "-"}</strong></div>
+                            <div style={{ fontSize: 10, color: "#14804a" }}>pay {gbp0(g.payable[i] || 0)}</div>
+                            <div style={{ fontSize: 10, color: "#8a8aa3" }}>other {gbp0(g.other[i] || 0)}</div>
+                          </>
+                        ) : <div>{v ? gbp0(v) : "-"}</div>}
+                        {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp0(plan)}</div>}
                         <label style={{ fontSize: 10, color: "#8a8aa3", cursor: "pointer", display: "inline-flex", gap: 3, alignItems: "center" }}>
                           <input type="checkbox" checked={marked} onChange={() => togglePaid(name, i)} style={{ margin: 0 }} />
                           paid
@@ -2264,14 +2349,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                       </td>
                     );
                   })}
-                  <td className="num mono"><strong>{gbp(sum(vals))}</strong></td>
+                  <td className="num mono"><strong>{gbp0(sum(vals))}</strong></td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
-      {agents.length === 0 && <div className="empty">No agents found for this year.</div>}
+      {shownAgents.length === 0 && <div className="empty">No agents match this filter.</div>}
     </div>
   );
 }
@@ -2282,6 +2367,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 // Same rules as the SchThrive / Chris P dashboards: these statuses never count
 // towards Net GP / Net SOV. Blank status is excluded too.
 const RED_GP_STATUS = /rejected|sent to customer|cancelled then reissued|cancelled/i;
+// how a status_config "tone" maps onto whether the GP is payable
+const TONE_MAP = {
+  green: "counts", success: "counts", positive: "counts", good: "counts", paid: "counts",
+  red: "red", danger: "red", negative: "red", error: "red", bad: "red",
+  amber: "review", orange: "review", warning: "review", warn: "review", pending: "review",
+  grey: "review", gray: "review", neutral: "review", info: "review", blue: "review",
+};
+const toneToTreatment = (tone) => TONE_MAP[String(tone || "").trim().toLowerCase()] || null;
 const isExcludedStatus = (st) => {
   const v = String(st || "").trim();
   if (!v) return true;
@@ -2289,10 +2382,17 @@ const isExcludedStatus = (st) => {
 };
 // user overrides from Settings -> Order Statuses win over the built-in rule
 const statusCounts = (statusSettings, st) => {
-  const v = (statusSettings || {})[String(st || "").trim()];
+  const key = String(st || "").trim();
+  const cfg = statusSettings || {};
+  const v = cfg[key] ?? cfg[key.toLowerCase()];
   if (v === "red") return false;
-  if (v === "counts") return true;
+  if (v === "counts" || v === "review") return true;   // review still pays; it just needs eyes on it
   return !isExcludedStatus(st);
+};
+const statusTreatment = (statusSettings, st) => {
+  const key = String(st || "").trim();
+  const cfg = statusSettings || {};
+  return cfg[key] ?? cfg[key.toLowerCase()] ?? (isExcludedStatus(st) ? "red" : "counts");
 };
 
 const isNonCommissionable = (r) =>
@@ -2316,7 +2416,8 @@ function Settings(props) {
   const { files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded,
     isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
     settings, saveSettings, settingsSaving, records, staffNames = [], staff = {}, loadStaff,
-    webosStatuses = { list: [], status: 'idle' }, probe = { status: 'idle', found: [] }, probeTables } = props;
+    webosStatuses = { list: [], status: 'idle' }, probe = { status: 'idle', found: [] }, probeTables,
+    statusConfig = { rows: [], status: 'idle', cols: {} }, managers = {} } = props;
   const [sub, setSub] = useState("risk");
   const thisFy = fyStartOf(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`);
   const planYears = [thisFy + 1, thisFy, thisFy - 1, thisFy - 2];
@@ -2330,12 +2431,19 @@ function Settings(props) {
   ];
 
   // every order status seen in the loaded data
+  const { nameCol: scName, toneCol: scTone } = statusConfig.cols || {};
   const allStatuses = useMemo(() => {
     const m = new Map();
     const get = (name) => {
-      if (!m.has(name)) m.set(name, { name, nsCount: 0, webosCount: 0, gp: 0 });
+      if (!m.has(name)) m.set(name, { name, nsCount: 0, webosCount: 0, gp: 0, tone: null });
       return m.get(name);
     };
+    if (scName && scTone) {
+      for (const r of statusConfig.rows) {
+        const nm = String(r[scName] || "").trim();
+        if (nm) get(nm).tone = r[scTone];
+      }
+    }
     records.forEach((r) => {
       const st = String(r.nsStatus || "").trim();
       const e = get(st);
@@ -2344,13 +2452,16 @@ function Settings(props) {
     });
     (webosStatuses.list || []).forEach((w) => { get(w.name).webosCount = w.n; });
     return [...m.values()].sort((a, b) => (b.nsCount + b.webosCount) - (a.nsCount + a.webosCount));
-  }, [records, webosStatuses]);
+  }, [records, webosStatuses, statusConfig]);
 
   const agentNames = useMemo(() => {
     const s = new Set(staffNames);
     records.forEach((r) => { if (r.agent) s.add(r.agent); });
-    return [...s].sort();
-  }, [records, staffNames.join()]);
+    return [...s].sort((a, b) => {
+      const ma = managers[a] || "zzz", mb = managers[b] || "zzz";
+      return ma.localeCompare(mb) || a.localeCompare(b);
+    });
+  }, [records, staffNames.join(), managers]);
 
   const risk = settings.risk || {};
   const suggestedRisk = (st) => (isExcludedStatus(st) ? "high" : "");
@@ -2375,18 +2486,16 @@ function Settings(props) {
           <p className="note" style={{ marginTop: 0 }}>
             Statuses marked <span className="chip risk">Red GP</span> are <strong>not counted</strong> towards GP or SOV —
             the same rule SchThrive WebOS uses. This drives the Cobra Dashboard and the Net figures on Cross-Reference.
-            {webosStatuses.status === "ok"
-              ? ` ${webosStatuses.list.length} statuses found in SchThrive.`
-              : webosStatuses.status === "error" ? " (Couldn't read SchThrive's orders table — showing NetSuite statuses only.)" : ""}
+            {statusConfig.status === "ok"
+              ? ` Treatment comes from the status_config table's "${scTone}" column; change one here to override it.`
+              : statusConfig.status === "error" ? " (Couldn't read status_config — using the built-in rules.)" : ""}
           </p>
           <div style={{ marginBottom: 12 }}>
             <button className="btn" onClick={() => {
-              const next = { ...risk };
-              allStatuses.forEach((st) => { next[st.name] = isExcludedStatus(st.name) ? "red" : "counts"; });
-              saveSettings({ ...settings, risk: next });
-            }}>Apply SchThrive defaults</button>
+              saveSettings({ ...settings, risk: {} });
+            }}>Reset to status_config</button>
             <span className="sub" style={{ marginLeft: 10 }}>
-              Marks rejected / sent to customer / cancelled / cancelled then reissued / blank as Red GP.
+              Clears any manual overrides so every status follows the database tone again.
             </span>
           </div>
           {allStatuses.length === 0 ? (
@@ -2398,25 +2507,33 @@ function Settings(props) {
                   <th className="left">Order status</th>
                   <th className="num">In NetSuite</th>
                   <th className="num">In SchThrive</th>
+                  <th className="num">Tone</th>
                   <th className="num">GP in NetSuite</th>
-                  <th className="num">Counts towards GP?</th>
+                  <th className="num">Payable?</th>
                 </tr></thead>
                 <tbody>
                   {allStatuses.map((st) => {
-                    const setting = risk[st.name] || (isExcludedStatus(st.name) ? "red" : "counts");
+                    const setting = risk[st.name] || toneToTreatment(st.tone) || (isExcludedStatus(st.name) ? "red" : "counts");
                     return (
                       <tr key={st.name || "(blank)"} style={{ background: setting === "red" ? "#fdf3f2" : undefined }}>
                         <td className="left">{st.name || <em className="sub">(blank)</em>}</td>
                         <td className="num mono">{st.nsCount || "-"}</td>
                         <td className="num mono">{st.webosCount || "-"}</td>
+                        <td className="num">{st.tone
+                          ? <span className="chip" style={{
+                              background: toneToTreatment(st.tone) === "red" ? "#fbe9e7" : toneToTreatment(st.tone) === "review" ? "#fbf0d9" : "#e6f4ec",
+                              color: toneToTreatment(st.tone) === "red" ? "#b3261e" : toneToTreatment(st.tone) === "review" ? "#8a5a00" : "#14804a",
+                            }}>{String(st.tone)}</span>
+                          : "-"}</td>
                         <td className="num mono">{st.gp ? gbp(st.gp) : "-"}</td>
                         <td className="num">
                           <select value={setting}
                             onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st.name]: e.target.value } })}
                             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13,
                               color: setting === "red" ? "#b3261e" : "#14804a", fontWeight: 600 }}>
-                            <option value="counts">Counts</option>
-                            <option value="red">Red GP (not counted)</option>
+                            <option value="counts">Payable</option>
+                            <option value="review">Review (still payable)</option>
+                            <option value="red">Red GP (not payable)</option>
                           </select>
                         </td>
                       </tr>
@@ -2531,6 +2648,7 @@ function Settings(props) {
                 <thead>
                   <tr>
                     <th className="left">Agent</th>
+                    <th className="left">Manager</th>
                     <th className="num">Standard</th>
                     {MONTHS_FY.map(([, l]) => <th key={l} className="num">{l}</th>)}
                     <th className="num">Year total</th>
@@ -2550,6 +2668,7 @@ function Settings(props) {
                     return (
                       <tr key={a2}>
                         <td className="left">{a2}</td>
+                        <td className="left sub">{managers[a2] || "-"}</td>
                         <td className="num">
                           <input type="number" value={payplans[a2] ?? ""} placeholder={dbPlans[a2] ? String(dbPlans[a2]) : "-"}
                             onChange={(e) => saveSettings({ ...settings, payplans: { ...payplans, [a2]: e.target.value === "" ? "" : Number(e.target.value) } })}
@@ -2968,5 +3087,217 @@ function Donut({ matched, review, exception }) {
       </text>
       <text x="60" y="72" textAnchor="middle" fontSize="8.5" fill="#8a8aa3">matched</text>
     </svg>
+  );
+}
+
+// =========================================================================
+//  Monthly Reports — a static NetSuite snapshot per month, compared to live
+// =========================================================================
+function MonthlyReports({ supabase, session, files, statusRules }) {
+  const thisFy = fyStartOf(`${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`);
+  const [year, setYear] = useState(thisFy);
+  const [saved, setSaved] = useState({});          // monthKey -> { rows, name, at, by }
+  const [busy, setBusy] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const [compare, setCompare] = useState(null);    // monthKey being compared
+
+  const keys = fyMonthKeys(year);
+  const rowId = (mk) => `static-${mk}`;
+
+  // load whatever snapshots already exist for this year
+  useEffect(() => {
+    if (!supabase || !session) return;
+    let cancelled = false;
+    (async () => {
+      const { data } = await supabase.from("recon_datasets").select("*").in("id", keys.map(rowId));
+      if (cancelled || !data) return;
+      const out = {};
+      for (const r of data) {
+        const mk = String(r.id).replace("static-", "");
+        if (r.netsuite) out[mk] = { ...r.netsuite, at: r.uploaded_at, by: r.uploaded_by };
+      }
+      setSaved(out);
+    })();
+    return () => { cancelled = true; };
+  }, [session, year]);
+
+  const upload = useCallback(async (mk, file) => {
+    if (!file || !supabase) return;
+    setBusy(mk); setMsg(null);
+    try {
+      const parsed = await parseWorkbook(file);
+      const slim = slimFileForSave({ sheet: parsed.sheet, name: file.name, rows: parsed.rows }, "netsuite");
+      const payload = {
+        id: rowId(mk), netsuite: slim,
+        uploaded_by: session?.user?.email || null, uploaded_at: new Date().toISOString(),
+      };
+      const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
+      if (error) setMsg({ err: true, text: "Couldn't save: " + error.message });
+      else {
+        setSaved((sv) => ({ ...sv, [mk]: { ...slim, at: payload.uploaded_at, by: payload.uploaded_by } }));
+        setMsg({ err: false, text: `${periodLabel(mk)} snapshot saved (${parsed.rows.length} rows).` });
+      }
+    } catch (e) {
+      setMsg({ err: true, text: "Couldn't read that file — is it a valid CSV or Excel export?" });
+    }
+    setBusy(null);
+  }, [session, keys.join()]);
+
+  const removeSnapshot = useCallback(async (mk) => {
+    if (!supabase) return;
+    await supabase.from("recon_datasets").delete().eq("id", rowId(mk));
+    setSaved((sv) => { const n = { ...sv }; delete n[mk]; return n; });
+  }, []);
+
+  // ---- compare a saved month against the live report ----
+  const diff = useMemo(() => {
+    if (!compare || !saved[compare]) return null;
+    const key = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
+    const build = (rows) => {
+      const m = new Map();
+      for (const raw of rows || []) {
+        const r = nsRow(raw);
+        const k = key(r);
+        if (!m.has(k)) m.set(k, { ...r, gp: 0, pay: 0 });
+        const e = m.get(k);
+        e.gp += r.expected || 0;
+        if (r.recordedCobra != null) e.pay = r.recordedCobra;
+      }
+      return m;
+    };
+    const snap = build(saved[compare].rows);
+    const liveAll = build(files.netsuite?.rows || []);
+    // only compare live rows from the same month
+    const live = new Map([...liveAll.entries()].filter(([, v]) => monthKey(v.date) === compare));
+
+    const removed = [], changed = [], unpaid = [], added = [];
+    for (const [k, a] of snap) {
+      const b = live.get(k);
+      if (!b) { removed.push({ ...a, was: a.gp }); continue; }
+      if (Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005) changed.push({ ...b, was: a.gp, now: b.gp });
+      const paidNow = b.itemPaid != null ? isYes(b.itemPaid) : b.statusPaid;
+      if (!paidNow && statusCounts(statusRules, b.status) && !isNonCommissionable(b) && (b.gp || 0) > 0) {
+        unpaid.push({ ...b, was: a.gp });
+      }
+    }
+    for (const [k, b] of live) if (!snap.has(k)) added.push(b);
+    return { removed, changed, unpaid, added, snapCount: snap.size, liveCount: live.size };
+  }, [compare, saved, files, statusRules]);
+
+  const Section = ({ title, rows, colour, cols }) => (
+    <div className="panel" style={{ borderLeft: `4px solid ${colour}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <h2 style={{ margin: 0 }}>{title} <span className="sub">({rows.length})</span></h2>
+        {rows.length > 0 && (
+          <button className="btn" onClick={() => downloadCSV(rows.map((r) => ({
+            "Order ref": r.orderNum || "", "NetSuite ref": r.netsuiteRef || "", Company: r.company || "",
+            Partner: r.partner || "", Item: r.product || "", Status: r.status || "",
+            "GP was": r.was ?? "", "GP now": r.now ?? r.gp ?? "",
+          })), `${title.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}-${compare}.csv`)}>Export</button>
+        )}
+      </div>
+      {rows.length === 0 ? <p className="note" style={{ marginTop: 8 }}>None.</p> : (
+        <div style={{ overflowX: "auto", marginTop: 8, maxHeight: 320, overflowY: "auto" }}>
+          <table>
+            <thead><tr>
+              <th className="left">Order</th><th className="left">Company</th><th className="left">Partner</th>
+              <th className="left">Status</th>{cols.map((c) => <th key={c} className="num">{c}</th>)}
+            </tr></thead>
+            <tbody>
+              {rows.slice(0, 300).map((r, i) => (
+                <tr key={i}>
+                  <td className="left mono">{r.orderNum || r.netsuiteRef || "-"}</td>
+                  <td className="left">{r.company || "-"}</td>
+                  <td className="left">{r.partner || "-"}</td>
+                  <td className="left">{r.status || "-"}</td>
+                  {cols.includes("Was") && <td className="num mono">{gbp(r.was)}</td>}
+                  {cols.includes("Now") && <td className="num mono">{gbp(r.now ?? r.gp)}</td>}
+                  {cols.includes("Change") && (
+                    <td className={"num mono " + ((r.now ?? r.gp) - r.was >= 0 ? "pos" : "neg")}>
+                      {gbp((r.now ?? r.gp) - r.was)}
+                    </td>
+                  )}
+                  {cols.includes("GP") && <td className="num mono">{gbp(r.gp)}</td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {rows.length > 300 && <p className="note">Showing 300 of {rows.length} — use Export for the full list.</p>}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <div className="panel">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <h2 style={{ margin: 0 }}>Monthly NetSuite snapshots — {fyLabel(year)}</h2>
+          <div className="settings">
+            <span>Financial year:</span>
+            <select value={year} onChange={(e) => { setYear(Number(e.target.value)); setCompare(null); }}
+              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+              {[thisFy + 1, thisFy, thisFy - 1, thisFy - 2].map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+            </select>
+          </div>
+        </div>
+        <p className="note" style={{ marginTop: 6 }}>
+          Upload the NetSuite report as it stood at each month end. Comparing a month against the live report shows
+          what has since been removed, re-valued, or is still sitting unpaid — using the same payable rules as the rest of the app.
+        </p>
+        {msg && <p className="sub" style={{ color: msg.err ? "#b3261e" : "#14804a" }}>{msg.text}</p>}
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr>
+              <th className="left">Month</th><th className="num">Rows</th><th className="left">Saved</th>
+              <th className="num">File</th><th className="num"></th>
+            </tr></thead>
+            <tbody>
+              {keys.map((mk, i) => {
+                const sv = saved[mk];
+                return (
+                  <tr key={mk} style={{ background: compare === mk ? "#efeaff" : undefined }}>
+                    <td className="left"><strong>{MONTHS_FY[i][1]}</strong> <span className="sub">{mk}</span></td>
+                    <td className="num mono">{sv ? sv.rows?.length ?? 0 : "-"}</td>
+                    <td className="left sub">{sv?.at ? `${new Date(sv.at).toLocaleDateString("en-GB")} · ${sv.by || ""}` : "not uploaded"}</td>
+                    <td className="num">
+                      <label className="file" style={{ fontSize: 11, padding: "5px 9px" }}>
+                        {busy === mk ? "Saving…" : sv ? "Replace" : "Upload"}
+                        <input type="file" accept=".csv,.tsv,.txt,.xlsx,.xls"
+                          onChange={(e) => upload(mk, e.target.files[0])} />
+                      </label>
+                    </td>
+                    <td className="num">
+                      {sv && (
+                        <>
+                          <button className="btn" style={{ marginRight: 6 }}
+                            onClick={() => setCompare(compare === mk ? null : mk)}>
+                            {compare === mk ? "Hide" : "Compare"}
+                          </button>
+                          <button className="btn" onClick={() => removeSnapshot(mk)}>Delete</button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {compare && !diff && <div className="empty panel">Loading that snapshot…</div>}
+      {compare && diff && (
+        <>
+          <div className="banner info">
+            <strong>{periodLabel(compare)}:</strong> snapshot holds {diff.snapCount} lines, the live report holds {diff.liveCount} for that month.
+          </div>
+          <Section title="Removed since the snapshot" rows={diff.removed} colour="#b3261e" cols={["Was"]} />
+          <Section title="Value changed" rows={diff.changed} colour="#d98a00" cols={["Was", "Now", "Change"]} />
+          <Section title="Still unpaid" rows={diff.unpaid} colour="#1e64d6" cols={["GP"]} />
+          <Section title="New since the snapshot" rows={diff.added} colour="#14804a" cols={["GP"]} />
+        </>
+      )}
+    </>
   );
 }
