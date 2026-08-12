@@ -1610,7 +1610,7 @@ const fmtPct = (v) => (v == null ? "-" : v.toFixed(2) + "%");
 // pull NetSuite + Cobra lines out of the loaded files (unfiltered by the month selector)
 function useSourceLines(files) {
   return useMemo(() => {
-    const ns = (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date) }));
+    const ns = (files.netsuite?.rows || []).map(nsRow).map((r) => ({ ...r, period: monthKey(r.date), rawDate: r.date }));
     const cb = (files.cobra?.rows || []).map(cobraRow).map((r) => ({ ...r, period: cobraPeriod(r) }));
     return { ns, cb };
   }, [files]);
@@ -1629,6 +1629,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
   }, [ns]);
 
   const [fy, setFy] = useState(null);
+  const [drill, setDrill] = useState(null);   // { label, monthIndex }
   const year = fy ?? years[0] ?? null;
   const keys = year != null ? fyMonthKeys(year) : [];
 
@@ -1701,8 +1702,14 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
         <strong>{label}</strong>
       </td>
       {vals.map((v, i) => (
-        <td key={i} className="num mono" style={{
-          background: danger && v != null && danger(v) ? "#fbe9e7" : undefined,
+        <td key={i} className="num mono"
+          onClick={tag === "Report" ? () => setDrill({ label, monthIndex: i }) : undefined}
+          title={tag === "Report" ? "Click to see the orders behind this figure" : undefined}
+          style={{
+          cursor: tag === "Report" ? "pointer" : undefined,
+          textDecoration: tag === "Report" && v ? "underline dotted" : undefined,
+          background: drill && drill.label === label && drill.monthIndex === i ? "#efeaff"
+            : danger && v != null && danger(v) ? "#fbe9e7" : undefined,
           color: danger && v != null && danger(v) ? "#b3261e" : undefined,
         }}>
           {kind === "input" ? (
@@ -1816,9 +1823,71 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
             </tbody>
           </table>
         </div>
+        {drill && (() => {
+          const mk = keys[drill.monthIndex];
+          const inMonth = ns.filter((r) => r.period === mk);
+          const seenDoc = new Set();
+          let list = [];
+          if (drill.label === "Latest stats") list = inMonth;
+          else if (drill.label === "O/S unpaid WIP") list = inMonth.filter((r) => (r.itemPaid != null ? !isYes(r.itemPaid) : !r.statusPaid));
+          else if (drill.label === "Latest Paid on Cobra") list = inMonth.filter((r) => {
+            if (r.recordedCobra == null) return false;
+            const k = String(r.docNo ?? r.orderNum ?? "");
+            if (seenDoc.has(k)) return false;
+            seenDoc.add(k); return true;
+          });
+          else if (drill.label === "Accelerator Owed" || drill.label === "Accelerator Paid") list = inMonth.filter((r) => isYes(r.accelerator));
+          else if (drill.label === "Overage") list = inMonth.filter((r) => money(r.overpayment) != null);
+          const val = (r) =>
+            drill.label === "Latest Paid on Cobra" || drill.label === "Accelerator Paid" ? r.recordedCobra
+              : drill.label === "Overage" ? money(r.overpayment) : r.expected;
+          return (
+            <div className="panel" style={{ background: "#faf9ff", marginTop: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                <h2 style={{ margin: 0 }}>{drill.label} — {periodLabel(mk)} ({list.length} rows, {gbp(sum(list.map(val)))})</h2>
+                <div>
+                  <button className="btn" style={{ marginRight: 6 }} onClick={() => downloadCSV(list.map((r) => ({
+                    "Order ref": r.orderNum || "", "NetSuite ref": r.netsuiteRef || "", Company: r.company || "",
+                    "Netsuite Date": r.rawDate == null ? "" : String(r.rawDate), Partner: r.partner || "", Role: r.partnerRole || "",
+                    Item: r.product || "", Status: r.status || "", Value: val(r) ?? "",
+                  })), `${drill.label.replace(/[^a-z0-9]+/gi, "-")}-${mk}.csv`)}>Export</button>
+                  <button className="btn" onClick={() => setDrill(null)}>Close</button>
+                </div>
+              </div>
+              {list.length === 0 ? <div className="empty">No rows behind this figure.</div> : (
+                <div style={{ overflowX: "auto", marginTop: 10, maxHeight: 420, overflowY: "auto" }}>
+                  <table>
+                    <thead><tr>
+                      <th className="left">Order ref</th><th className="left">NetSuite ref</th><th className="left">Company</th>
+                      <th className="left">Netsuite Date</th><th className="left">Partner</th><th className="left">Item</th>
+                      <th className="left">Status</th><th className="num">Value</th>
+                    </tr></thead>
+                    <tbody>
+                      {list.slice(0, 500).map((r, i) => (
+                        <tr key={i}>
+                          <td className="left mono">{r.orderNum || "-"}</td>
+                          <td className="left mono">{r.netsuiteRef || "-"}</td>
+                          <td className="left">{r.company || "-"}</td>
+                          <td className="left mono">{r.rawDate == null || r.rawDate === "" ? "(blank)" : String(r.rawDate)}</td>
+                          <td className="left">{r.partner || r.agent || "-"}</td>
+                          <td className="left">{r.product || "-"}</td>
+                          <td className="left">{r.status || "-"}</td>
+                          <td className="num mono">{gbp(val(r))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {list.length > 500 && <p className="note">Showing the first 500 — use Export for the full list.</p>}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         <p className="note">
-          <strong>Source:</strong> this page uses the NetSuite report only. Rows are placed by
-          {" "}<span className="mono">Netsuite Date</span> (read as day/month/year).
+          <strong>Source:</strong> NetSuite report only, and the month comes from the
+          {" "}<span className="mono">Netsuite Date</span> column alone (day/month/year) — no other date column is used.
+          Click any <span className="chip matched" style={{ fontSize: 10 }}>Report</span> figure to see the orders behind it.
           {" "}{diag.nsIn} rows fall in {fyLabel(year)}; {diag.nsNoDate} have no readable date
           {diag.nsOther > 0 ? ` and ${diag.nsOther} sit in other years` : ""}.
         </p>
@@ -1845,6 +1914,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     return [...s].sort((a, b) => b - a);
   }, [ns]);
   const [fy, setFy] = useState(null);
+  const [drill, setDrill] = useState(null);   // { label, monthIndex }
   const year = fy ?? years[0] ?? null;
   const keys = year != null ? fyMonthKeys(year) : [];
   const idx = useMemo(() => new Map(keys.map((k, i) => [k, i])), [keys.join()]);
