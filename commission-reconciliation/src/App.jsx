@@ -1520,13 +1520,14 @@ function CrossReference({ records, settings }) {
   const [sheets, setSheets] = useState("all");
   const [paidView, setPaidView] = useState("show");
   const [sort, setSort] = useState({ col: "diff", dir: "desc" });
+  const [showCount, setShowCount] = useState(200);
 
   const spread = (vals) => { const v = vals.filter((x) => x != null); if (!v.length) return 0; return Math.max(...v) - Math.min(...v); };
   const isPaid = (r) => /paid/i.test(String(r.nsStatus || ""));
 
   // GP delta: Cobra paid MINUS what we expected.
   // positive = BT paid us more than expected (good, green); negative = underpaid (bad, red)
-  const enriched = records.map((r) => ({
+  const enriched = useMemo(() => records.map((r) => ({
     ...r,
     sovSpread: spread([r.inNS ? r.nsSov : null, r.inSch5 ? r.s5Sov : null, r.inCobra ? r.cobraSov : null]),
     gpDiff: (r.inCobra ? r.paid : 0) - (r.inNS ? r.expected : 0),
@@ -1535,9 +1536,10 @@ function CrossReference({ records, settings }) {
     paid: r.paid,
     paidFlag: isPaid(r),
     risk: riskOf(r),
-  }));
+  })), [records, settings]);
 
-  const groups = [...new Set(enriched.map((r) => r.productGroup).filter(Boolean))].sort();
+  const groups = useMemo(
+    () => [...new Set(enriched.map((r) => r.productGroup).filter(Boolean))].sort(), [enriched]);
 
   const bySheets = (r) => {
     if (sheets === "all") return true;
@@ -1557,9 +1559,9 @@ function CrossReference({ records, settings }) {
     return true;
   };
 
-  const filtered = enriched.filter(
+  const filtered = useMemo(() => enriched.filter(
     (r) => (group === "all" || (r.productGroup || "(blank)") === group) && bySheets(r) && byPaid(r)
-  );
+  ), [enriched, group, sheets, paidView]);
 
   const getVal = (r, col) => {
     switch (col) {
@@ -1582,7 +1584,7 @@ function CrossReference({ records, settings }) {
     }
   };
 
-  const rows = [...filtered].sort((a, b) => {
+  const rows = useMemo(() => [...filtered].sort((a, b) => {
     const av = getVal(a, sort.col), bv = getVal(b, sort.col);
     const an = av == null, bn = bv == null;
     if (an && bn) return 0;
@@ -1592,19 +1594,19 @@ function CrossReference({ records, settings }) {
     if (typeof av === "number" && typeof bv === "number") c = av - bv;
     else c = String(av).localeCompare(String(bv));
     return sort.dir === "asc" ? c : -c;
-  });
+  }), [filtered, sort]);
 
-  const T = {
-    nsSov: sum(filtered.map((r) => r.nsSov)),
-    nsGp: sum(filtered.map((r) => r.expected)),
-    s5Sov: sum(filtered.map((r) => r.s5Sov)),
-    cbSov: sum(filtered.map((r) => r.cobraSov)),
-    cbGp: sum(filtered.map((r) => r.paid)),
-    netSov: sum(filtered.map((r) => r.netSov)),
-    netGp: sum(filtered.map((r) => r.netGp)),
-  };
+  const T = useMemo(() => {
+    const t = { nsSov: 0, nsGp: 0, s5Sov: 0, cbSov: 0, cbGp: 0, netSov: 0, netGp: 0 };
+    for (const r of filtered) {
+      t.nsSov += r.nsSov || 0; t.nsGp += r.expected || 0; t.s5Sov += r.s5Sov || 0;
+      t.cbSov += r.cobraSov || 0; t.cbGp += r.paid || 0;
+      t.netSov += r.netSov || 0; t.netGp += r.netGp || 0;
+    }
+    return t;
+  }, [filtered]);
 
-  const shown = rows.slice(0, 1000);
+  const shown = rows.slice(0, showCount);
   const cell = (v) => <span className="num mono">{gbp(v)}</span>;
   const diffCell = (v) => <span className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>{gbp(v)}</span>;
   const selStyle = { padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 };
@@ -1740,7 +1742,12 @@ function CrossReference({ records, settings }) {
             </tbody>
           </table>
         </div>
-        {rows.length > 1000 && <p className="note">Showing 1,000 of {rows.length} references. Narrow with the filters or the month selector.</p>}
+        {rows.length > shown.length && (
+          <p className="note">
+            Showing {shown.length.toLocaleString()} of {rows.length.toLocaleString()} references.{" "}
+            <button className="btn" onClick={() => setShowCount((n) => n + 500)}>Show 500 more</button>
+          </p>
+        )}
         {rows.length === 0 && <div className="empty">Nothing matches these filters.</div>}
       </div>
     </>
@@ -2117,7 +2124,7 @@ function buildDiff(snap, live, catOf) {
     const nowCat = catOf(b);
     if (!a) {
       rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new",
-        was: null, now: b.gp, becamePayable: nowCat === "payable", lostPayable: false });
+        was: null, now: b.gp, becamePayable: false, lostPayable: false });
       continue;
     }
     const wasCat = catOf(a);
@@ -2128,6 +2135,7 @@ function buildDiff(snap, live, catOf) {
       ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
       becamePayable: wasCat !== "payable" && nowCat === "payable",
       lostPayable: wasCat === "payable" && nowCat !== "payable",
+      valueChanged: valueMoved,
       change: valueMoved && (catMoved || statusMoved) ? "value+status"
         : valueMoved ? "value"
           : catMoved ? "status"
@@ -2137,7 +2145,7 @@ function buildDiff(snap, live, catOf) {
   for (const [k, a] of snap) {
     if (live.has(k)) continue;
     rows.push({ ...a, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
-      change: "removed", was: a.gp, now: 0, becamePayable: false, lostPayable: catOf(a) === "payable" });
+      change: "removed", was: a.gp, now: 0, becamePayable: false, lostPayable: false });
   }
   return rows;
 }
@@ -2321,7 +2329,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     (statics[keys[i]] ? (allChanges.get(`${agent}|${i}`) || []) : null), [allChanges, statics, keys.join()]);
 
   const [drill, setDrill] = useState(null);   // { agent, i }
-  const [drillFilter, setDrillFilter] = useState("all");   // all | gained | lost
+  const [drillFilter, setDrillFilter] = useState("all");   // all | added | removed | value | gained | lost
 
   // manager filter
   const [mgr, setMgr] = useState("all");
@@ -2612,7 +2620,14 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
         ) : (() => {
           const gained = drillRows.filter((r) => r.becamePayable);
           const lost = drillRows.filter((r) => r.lostPayable);
-          const base = drillFilter === "gained" ? gained : drillFilter === "lost" ? lost : drillRows;
+          const added = drillRows.filter((r) => r.change === "new");
+          const removed = drillRows.filter((r) => r.change === "removed");
+          const valued = drillRows.filter((r) => r.valueChanged);
+          const base = drillFilter === "gained" ? gained
+            : drillFilter === "lost" ? lost
+              : drillFilter === "added" ? added
+                : drillFilter === "removed" ? removed
+                  : drillFilter === "value" ? valued : drillRows;
           const moved = base.filter((r) => r.change);
           const rest = drillFilter === "all" ? base.filter((r) => !r.change) : [];
           const hue = (r) => r.change === "removed" ? "#f7c8c2"
@@ -2702,6 +2717,9 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
               })()}
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
                 {[["all", `All changes (${drillRows.filter((r) => r.change).length})`],
+                  ["added", `Added since PR (${added.length})`],
+                  ["removed", `Removed since PR (${removed.length})`],
+                  ["value", `Value change (${valued.length})`],
                   ["gained", `Now payable (${gained.length})`],
                   ["lost", `No longer payable (${lost.length})`]].map(([v, l]) => (
                   <button key={v} className={"tab " + (drillFilter === v ? "active" : "")}
@@ -2722,11 +2740,11 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                     {moved.length > 0 && rest.length > 0 && (
                       <tr><td colSpan={4} style={{ background: "#f7f6fc", fontSize: 11, color: "#8a8aa3" }}>Unchanged</td></tr>
                     )}
-                    {rest.slice(0, 250).map((r, i) => <Line key={"r" + i} r={r} i={i} />)}
+                    {rest.slice(0, 100).map((r, i) => <Line key={"r" + i} r={r} i={i} />)}
                   </tbody>
                 </table>
               </div>
-              {rest.length > 250 && <p className="note">Showing 250 unchanged lines of {rest.length}.</p>}
+              {rest.length > 100 && <p className="note">Showing 100 unchanged lines of {rest.length}.</p>}
             </>
           );
         })()}
@@ -3542,7 +3560,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
                   <th className="num">GP now</th><th className="num">Change</th><th className="left">Reason</th>
                 </tr></thead>
                 <tbody>
-                  {flagged.slice(0, 200).map((r, i) => {
+                  {flagged.slice(0, 100).map((r, i) => {
                     const delta = (r.now || 0) - (r.was || 0);
                     return (
                       <tr key={i} style={{ background: r.reason.includes("Removed") ? "#f7c8c2"
@@ -3585,7 +3603,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
                   })}
                 </tbody>
               </table>
-              {flagged.length > 200 && <p className="note">Showing 200 of {flagged.length} — use Export for the full list.</p>}
+              {flagged.length > 100 && <p className="note">Showing 100 of {flagged.length} — use Export for the full list.</p>}
             </div>
           )}
         </div>
@@ -3784,7 +3802,7 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
               <th className="left">Status</th>{cols.map((c) => <th key={c} className="num">{c}</th>)}
             </tr></thead>
             <tbody>
-              {rows.slice(0, 300).map((r, i) => (
+              {rows.slice(0, 150).map((r, i) => (
                 <tr key={i}>
                   <td className="left mono">{r.orderNum || r.netsuiteRef || "-"}</td>
                   <td className="left">{r.company || "-"}</td>
@@ -3802,7 +3820,7 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
               ))}
             </tbody>
           </table>
-          {rows.length > 300 && <p className="note">Showing 300 of {rows.length} — use Export for the full list.</p>}
+          {rows.length > 150 && <p className="note">Showing 150 of {rows.length} — use Export for the full list.</p>}
         </div>
       )}
     </div>
