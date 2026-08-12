@@ -85,6 +85,18 @@ const periodLabel = (key) => {
 };
 
 // resolve a value from a raw row by trying candidate header names (exact, then fuzzy)
+// exact-name lookup only. Used for dates: a fuzzy match on "Date" would happily
+// grab "Expected Order Close Date" and scatter rows into future months.
+const pickExact = (row, candidates) => {
+  const clean = (s) => String(s).toLowerCase().replace(/\s+/g, " ").trim();
+  const keys = Object.keys(row);
+  for (const c of candidates) {
+    const hit = keys.find((k) => clean(k) === clean(c));
+    if (hit !== undefined && row[hit] !== null && row[hit] !== "") return row[hit];
+  }
+  return undefined;
+};
+
 const pick = (row, candidates) => {
   const keys = Object.keys(row);
   const clean = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
@@ -222,7 +234,8 @@ const nsRow = (r) => ({
   accelerator: firstDefined(pick(r, ["Accelerator?", "Accelerator"])),
   agent: firstDefined(pick(r, ["Admin Agent"])),
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
-  date: firstDefined(pick(r, ["Netsuite Date"]), pick(r, ["Date"]), pick(r, ["Order Status Last Changed Date"])),
+  // month comes from Netsuite Date only (or "Date" in the new report) — never another date column
+  date: firstDefined(pickExact(r, ["Netsuite Date"]), pickExact(r, ["Date"])),
   productGroup2: firstDefined(pick(r, ["Item: Product Group 2"]), pick(r, ["Product Group 2", "Product Group2"])),
   netsuiteRef: firstDefined(pick(r, ["Netsuite Ref", "NetSuite Ref"]), pick(r, ["Document Number"])),
   raw: r,
@@ -410,6 +423,11 @@ function reconcile(files, tol, period = "all") {
       nsStatus: firstDefined(...nsL.map((x) => x.status)),
       status: firstDefined(nsL[0]?.status, cbL[0]?.status, s5L[0]?.status),
       sch5Status: firstDefined(s5L[0]?.status),
+      // Net figures use the SchThrive rule: drop excluded statuses and non-commissionable lines
+      netSov: isExcludedStatus(firstDefined(...nsL.map((x) => x.status)))
+        ? 0 : sum(nsL.filter((x) => !isNonCommissionable(x)).map((x) => x.sov)),
+      netGp: isExcludedStatus(firstDefined(...nsL.map((x) => x.status)))
+        ? 0 : sum(nsL.filter((x) => !isNonCommissionable(x)).map((x) => x.expected)),
       flags, matchState,
       nsL, cbL, s5L,
     });
@@ -598,6 +616,8 @@ export default function ReconciliationTool() {
   // agent list from the existing SchThrive `staff` table (read-only; no schema change)
   const [staff, setStaff] = useState({ rows: [], status: "idle", planCol: null });
 
+  const EXCLUDED_MANAGER = "tracy webber";
+
   const loadStaff = useCallback(async () => {
     if (!supabase || !session) return;
     setStaff((s) => ({ ...s, status: "loading" }));
@@ -605,7 +625,25 @@ export default function ReconciliationTool() {
     if (error || !data) { setStaff({ rows: [], status: "error", planCol: null, msg: error?.message }); return; }
     const cols = data.length ? Object.keys(data[0]) : [];
     const planCol = cols.find((c) => /pay ?_?plan|target|quota/i.test(c)) || null;
-    setStaff({ rows: data, status: "ok", planCol });
+    const mgrCols = cols.filter((c) => /manager|team/i.test(c));
+    // the Order Delivery team (Tracy Webber) never owns sales, so drop them
+    const rows = data.filter((r) => !mgrCols.some((c) => String(r[c] || "").toLowerCase().includes(EXCLUDED_MANAGER)));
+    // payplans may live in their own table; fall back to a column on staff
+    let plans = {};
+    const nameOf = (r) => {
+      const nc = cols.find((c) => /^(name|full_?name|agent)$/i.test(c)) || cols.find((c) => /name/i.test(c));
+      return nc ? String(r[nc] || "").trim() : "";
+    };
+    const { data: pp } = await supabase.from("payplans").select("*");
+    if (pp && pp.length) {
+      const pcols = Object.keys(pp[0]);
+      const pName = pcols.find((c) => /name|agent|staff/i.test(c));
+      const pVal = pcols.find((c) => /pay ?_?plan|amount|target|value|quota/i.test(c));
+      if (pName && pVal) for (const r of pp) plans[String(r[pName] || "").trim()] = Number(r[pVal]) || 0;
+    } else if (planCol) {
+      for (const r of rows) plans[nameOf(r)] = Number(r[planCol]) || 0;
+    }
+    setStaff({ rows, status: "ok", planCol, plans, excluded: data.length - rows.length });
   }, [session]);
 
   useEffect(() => { loadStaff(); }, [loadStaff]);
@@ -949,7 +987,7 @@ export default function ReconciliationTool() {
 
             {tab === "wip" && <WipTracker files={files} settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving} />}
 
-            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames} />}
+            {tab === "agents" && <AgentPayments files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames} dbPlans={staff.plans || {}} />}
 
             {/* RECONCILIATION */}
             {tab === "reconcile" && (
@@ -1401,6 +1439,8 @@ function CrossReference({ records, settings }) {
     s5Sov: sum(filtered.map((r) => r.s5Sov)),
     cbSov: sum(filtered.map((r) => r.cobraSov)),
     cbGp: sum(filtered.map((r) => r.paid)),
+    netSov: sum(filtered.map((r) => r.netSov)),
+    netGp: sum(filtered.map((r) => r.netGp)),
   };
 
   const shown = rows.slice(0, 1000);
@@ -1795,7 +1835,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
-function AgentPayments({ files, settings, saveSettings, staffNames = [] }) {
+function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans = {} }) {
   const { ns, cb } = useSourceLines(files);
   const [basis, setBasis] = useState("earned");
 
@@ -1821,18 +1861,20 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [] }) {
     for (const r of ns) {
       const i = idx.get(r.period);
       if (i == null) continue;
-      const name = r.agent || "(unassigned)";
+      const name = r.partner || r.agent || "(unassigned)";   // GP is credited to the Partner
       if (!m.has(name)) m.set(name, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
       const g = m.get(name);
       g.earned[i] += r.expected || 0;
       g.paid[i] += paidByOrder.get(r.orderNum) || 0;
     }
-    // make sure everyone on the staff list appears, even with no orders this year
     for (const n of staffNames) if (!m.has(n)) m.set(n, { earned: keys.map(() => 0), paid: keys.map(() => 0) });
-    return [...m.entries()].sort((a, b) => sum(b[1].earned) - sum(a[1].earned));
+    // if we have a staff list, only show those people (drops Office Doublecount, ex-staff, Tracy's team)
+    const allow = new Set(staffNames.map((n) => n.toLowerCase()));
+    const out = [...m.entries()].filter(([n]) => !staffNames.length || allow.has(n.toLowerCase()));
+    return out.sort((a, b) => sum(b[1].earned) - sum(a[1].earned));
   }, [ns, idx, paidByOrder, keys.join(), staffNames.join()]);
 
-  const payplans = settings.payplans || {};
+  const payplans = { ...dbPlans, ...(settings.payplans || {}) };   // manual overrides win
   const paidMarks = settings.paidMarks || {};
   const markKey = (agent, i) => `${year}|${agent}|${i}`;
   const isMarkedPaid = (agent, i) => !!paidMarks[markKey(agent, i)];
@@ -1919,6 +1961,18 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [] }) {
 // =========================================================================
 //  Settings — Risk Levels · Payplans · Raw Data · Users
 // =========================================================================
+// Same rules as the SchThrive / Chris P dashboards: these statuses never count
+// towards Net GP / Net SOV. Blank status is excluded too.
+const RED_GP_STATUS = /rejected|sent to customer|cancelled then reissued|cancelled/i;
+const isExcludedStatus = (st) => {
+  const v = String(st || "").trim();
+  if (!v) return true;
+  return RED_GP_STATUS.test(v);
+};
+const isNonCommissionable = (r) =>
+  /non-?commissionable/i.test(String(r.productGroup2 || "")) ||
+  /non-?commissionable/i.test(String(r.product || ""));
+
 const RISK_LEVELS = [
   ["", "Not set"],
   ["none", "No risk"],
@@ -1959,7 +2013,9 @@ function Settings(props) {
   }, [records, staffNames.join()]);
 
   const risk = settings.risk || {};
+  const suggestedRisk = (st) => (isExcludedStatus(st) ? "high" : "");
   const payplans = settings.payplans || {};
+  const dbPlans = staff.plans || {};
 
   return (
     <>
@@ -1980,13 +2036,25 @@ function Settings(props) {
           {statuses.length === 0 ? (
             <div className="empty">No order statuses found — load the NetSuite export first.</div>
           ) : (
+            <>
+            <div style={{ marginBottom: 10 }}>
+              <button className="btn" onClick={() => {
+                const next = { ...risk };
+                statuses.forEach((st) => { if (!next[st]) next[st] = suggestedRisk(st) || "none"; });
+                saveSettings({ ...settings, risk: next });
+              }}>Apply SchThrive defaults</button>
+              <span className="sub" style={{ marginLeft: 10 }}>
+                Marks rejected / sent to customer / cancelled / cancelled then reissued / blank as High risk — the same statuses SchThrive excludes from GP.
+              </span>
+            </div>
             <table>
-              <thead><tr><th className="left">Order status</th><th className="num">Orders</th><th className="num">Risk level</th></tr></thead>
+              <thead><tr><th className="left">Order status</th><th className="num">Orders</th><th className="num">Excluded from Net</th><th className="num">Risk level</th></tr></thead>
               <tbody>
                 {statuses.map((st) => (
                   <tr key={st}>
                     <td className="left">{st}</td>
                     <td className="num mono">{records.filter((r) => String(r.nsStatus || "").trim() === st).length}</td>
+                    <td className="num">{isExcludedStatus(st) ? <span className="chip risk">excluded</span> : <span className="chip matched">counts</span>}</td>
                     <td className="num">
                       <select value={risk[st] || ""}
                         onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st]: e.target.value } })}
@@ -1998,6 +2066,7 @@ function Settings(props) {
                 ))}
               </tbody>
             </table>
+            </>
           )}
         </div>
       )}
@@ -2013,7 +2082,7 @@ function Settings(props) {
             <button className="btn" onClick={loadStaff}>Reload agents from staff list</button>
             <span className="sub" style={{ margin: 0 }}>
               {staff.status === "ok"
-                ? `${staffNames.length} agents from the staff table${staff.planCol ? ` (payplan column "${staff.planCol}" found)` : " — no payplan column found, so set them here"}`
+                ? `${staffNames.length} agents from the staff list${staff.excluded ? `, ${staff.excluded} excluded (Tracy Webber's team)` : ""}${Object.keys(staff.plans || {}).length ? ` · payplans loaded from the database` : " · no payplans in the database, so set them here"}`
                 : staff.status === "error"
                   ? "Couldn't read the staff table — showing only agents found in NetSuite."
                   : "Loading the staff list…"}
@@ -2029,7 +2098,7 @@ function Settings(props) {
                   <tr key={a}>
                     <td className="left">{a}</td>
                     <td className="num">
-                      <input type="number" value={payplans[a] ?? ""} placeholder="-"
+                      <input type="number" value={payplans[a] ?? ""} placeholder={dbPlans[a] ? String(dbPlans[a]) : "-"}
                         onChange={(e) => saveSettings({ ...settings, payplans: { ...payplans, [a]: e.target.value === "" ? "" : Number(e.target.value) } })}
                         style={{ width: 120, padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13, textAlign: "center" }} />
                     </td>
