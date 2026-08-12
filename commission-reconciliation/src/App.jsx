@@ -1190,7 +1190,8 @@ export default function ReconciliationTool() {
           <>
             {tab === "overview" && (
               <Overview records={result.records} files={files} settings={settings}
-                snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab} />
+                snapshot={snapshot} saveSnapshot={saveSnapshot} setTab={setTab}
+                supabase={supabase} session={session} statusRules={effectiveStatusRules} />
             )}
 
             {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
@@ -2174,6 +2175,20 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
 // =========================================================================
 //  Payments Per Agent
 // =========================================================================
+// Total = everything except red. Payable = payable tone. Waiting = claimed + issued.
+const summariseGp = (rows, statusRules) => {
+  let total = 0, payable = 0, waiting = 0;
+  for (const r of rows || []) {
+    const gp = r.expected || 0;
+    const cat = isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status);
+    if (cat === "red") continue;
+    total += gp;
+    if (cat === "payable") payable += gp;
+    else waiting += gp;
+  }
+  return { total, payable, waiting };
+};
+
 const blankAgent = (n) => ({
   earned: Array(n).fill(0), payable: Array(n).fill(0), claimed: Array(n).fill(0),
   issued: Array(n).fill(0), red: Array(n).fill(0), claimedIssued: Array(n).fill(0), paid: Array(n).fill(0),
@@ -2275,7 +2290,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
       const catMoved = wasCat !== nowCat;
       rows.push({
-        ...b, cat: nowCat, wasCat, was: a.gp, now: b.gp,
+        ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
         change: valueMoved && catMoved ? "value+status" : valueMoved ? "value" : catMoved ? "status" : null,
       });
     }
@@ -2337,6 +2352,20 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
 
+  // static vs live totals across the agents currently shown
+  const headline = useMemo(() => {
+    const allow = new Set(shownAgents.map(([n]) => n));
+    const mine = (r) => allow.has(r.partner || r.agent || "(unassigned)");
+    const liveRows = ns.filter((r) => idx.get(r.period) != null && mine(r));
+    const staticRows = keys.flatMap((mk) => (statics[mk] || []).filter(mine));
+    const live = summariseGp(liveRows, statusRules);
+    const stat = summariseGp(staticRows, statusRules);
+    return {
+      live, stat, months: keys.filter((mk) => statics[mk]).length,
+      diff: { total: live.total - stat.total, payable: live.payable - stat.payable, waiting: live.waiting - stat.waiting },
+    };
+  }, [ns, statics, shownAgents, keys.join(), statusRules, idx]);
+
   const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
 
   return (
@@ -2363,7 +2392,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
             <option value="earned">Total GP</option>
             <option value="payable">Payable GP only</option>
-            <option value="claimedIssued">Claimed + Issued only</option>
+            <option value="claimedIssued">Waiting only</option>
             <option value="paid">Paid on Cobra</option>
           </select>
         </div>
@@ -2371,10 +2400,45 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       <p className="note" style={{ marginTop: 6 }}>
         Each cell shows <strong>Total GP</strong> (red statuses ignored), with{" "}
         <span style={{ color: "#14804a" }}>payable</span> and{" "}
-        <span style={{ color: "#8a5a00" }}>claimed + issued</span> beneath it — categories come from the
+        <span style={{ color: "#8a5a00" }}>waiting</span> beneath it — categories come from the
         status_config tone. Click a cell to see that month's orders on the right. Red background = below target. Targets come from the database where available, and can be
         overridden in Settings → Payplans. Tick a cell to mark the agent paid for that month.
       </p>
+
+      <div style={{ overflowX: "auto", marginBottom: 14 }}>
+        <table>
+          <thead><tr>
+            <th className="left">GP position</th>
+            <th className="num">Total</th><th className="num">Payable</th><th className="num">Waiting</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td className="left"><strong>Static report</strong>
+                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>
+                  {headline.months ? `${headline.months} month-end snapshot${headline.months === 1 ? "" : "s"}` : "none uploaded"}
+                </div>
+              </td>
+              <td className="num mono">{headline.months ? gbp0(headline.stat.total) : "-"}</td>
+              <td className="num mono">{headline.months ? gbp0(headline.stat.payable) : "-"}</td>
+              <td className="num mono">{headline.months ? gbp0(headline.stat.waiting) : "-"}</td>
+            </tr>
+            <tr>
+              <td className="left"><strong>Live report</strong></td>
+              <td className="num mono">{gbp0(headline.live.total)}</td>
+              <td className="num mono">{gbp0(headline.live.payable)}</td>
+              <td className="num mono">{gbp0(headline.live.waiting)}</td>
+            </tr>
+            <tr style={{ background: "#faf9ff" }}>
+              <td className="left"><strong>Difference</strong></td>
+              {["total", "payable", "waiting"].map((f) => (
+                <td key={f} className={"num mono " + (headline.months ? (headline.diff[f] >= 0 ? "pos" : "neg") : "")}>
+                  {headline.months ? `${headline.diff[f] > 0 ? "+" : ""}${gbp0(headline.diff[f])}` : "-"}
+                </td>
+              ))}
+            </tr>
+          </tbody>
+        </table>
+      </div>
 
       {breaches.length > 0 && (
         <div className="banner" style={{ marginBottom: 12 }}>
@@ -2442,7 +2506,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                           <>
                             <div><strong>{v ? gbp0(v) : "-"}</strong></div>
                             <div style={{ fontSize: 10, color: "#14804a" }}>payable {gbp0(g.payable[i] || 0)}</div>
-                            <div style={{ fontSize: 10, color: "#8a5a00" }}>cl+iss {gbp0(g.claimedIssued[i] || 0)}</div>
+                            <div style={{ fontSize: 10, color: "#8a5a00" }}>waiting {gbp0(g.claimedIssued[i] || 0)}</div>
                           </>
                         ) : <div>{v ? gbp0(v) : "-"}</div>}
                         {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp0(plan)}</div>}
@@ -2490,11 +2554,21 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                 <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.product || "-"}</div>
               </td>
               <td className="left">
-                <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
-                {r.wasCat && r.wasCat !== r.cat && (
-                  <div className="sub" style={{ margin: 0, fontSize: 10 }}>was {r.wasCat}</div>
+                {r.wasCat && r.wasCat !== r.cat ? (
+                  <>
+                    <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat}</span>
+                    <span style={{ margin: "0 4px", color: "#8a8aa3" }}>→</span>
+                    <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                    <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>
+                      {r.wasStatus || "-"} → {r.status || "-"}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                    <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
+                  </>
                 )}
-                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
               </td>
               <td className="num mono">
                 {r.was != null && r.was !== r.now && <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>was {gbp0(r.was)}</div>}
@@ -2966,7 +3040,7 @@ function Settings(props) {
 // =========================================================================
 //  Overview — the landing page
 // =========================================================================
-function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) {
+function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, supabase, session, statusRules = {} }) {
   const { ns, cb, s5 } = useSourceLines(files);
 
   // financial years present across all three sources
@@ -3048,12 +3122,68 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
   const maxY = Math.max(1, ...monthly.flatMap((d) => SERIES.map(([kk]) => d[kk])));
   const niceMax = Math.ceil(maxY / 50000) * 50000 || maxY;
 
-  // ---- exceptions needing action ----
-  const exceptions = useMemo(() =>
-    recs.filter((r) => r.flags.length)
-      .sort((a, b) => Math.max(0, ...b.flags.map((f) => f.sev)) - Math.max(0, ...a.flags.map((f) => f.sev)))
-      .slice(0, 8), [recs]);
+  // ---- orders that have moved since the month-end (payroll) snapshots ----
+  const [statics, setStatics] = useState({});
+  useEffect(() => {
+    if (!supabase || !session || cYear == null) return;
+    let cancelled = false;
+    (async () => {
+      const mks = fyMonthKeys(cYear);
+      const { data } = await supabase.from("recon_datasets").select("*").in("id", mks.map((mk) => `static-${mk}`));
+      if (cancelled || !data) return;
+      const out = {};
+      for (const r of data) {
+        const mk = String(r.id).replace("static-", "");
+        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+      }
+      setStatics(out);
+    })();
+    return () => { cancelled = true; };
+  }, [session, cYear]);
 
+  const flagged = useMemo(() => {
+    if (cYear == null) return [];
+    const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
+    const catOf = (r) => (isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status));
+    const out = [];
+    for (const mk of fyMonthKeys(cYear)) {
+      const snapRows = statics[mk];
+      if (!snapRows) continue;
+      const snap = new Map();
+      for (const r of snapRows) {
+        const k = lineKey(r);
+        if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
+        snap.get(k).gp += r.expected || 0;
+      }
+      const live = new Map();
+      for (const r of ns) {
+        if (r.period !== mk) continue;
+        const k = lineKey(r);
+        if (!live.has(k)) live.set(k, { ...r, gp: 0 });
+        live.get(k).gp += r.expected || 0;
+      }
+      for (const [k, b] of live) {
+        const a = snap.get(k);
+        if (!a) { out.push({ ...b, mk, cat: catOf(b), was: null, now: b.gp, reason: "New since payroll" }); continue; }
+        const wasCat = catOf(a), nowCat = catOf(b);
+        const moved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
+        if (!moved && wasCat === nowCat) continue;
+        const reason = moved && wasCat !== nowCat ? "Value and status changed"
+          : moved ? ((b.gp || 0) > (a.gp || 0) ? "Value increased" : "Value reduced")
+            : nowCat === "red" ? "Moved into a red status"
+              : nowCat === "payable" ? "Became payable"
+                : `Moved to ${nowCat}`;
+        out.push({ ...b, mk, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp, reason });
+      }
+      for (const [k, a] of snap) {
+        if (!live.has(k)) out.push({ ...a, mk, cat: catOf(a), was: a.gp, now: 0, reason: "Removed since payroll" });
+      }
+    }
+    const rank = (r) => (r.reason.includes("Removed") ? 0 : r.reason.includes("red") ? 1 : 2);
+    return out.sort((a, b) => rank(a) - rank(b) || Math.abs((b.now - (b.was || 0))) - Math.abs((a.now - (a.was || 0))));
+  }, [statics, ns, cYear, statusRules]);
+
+  // ---- exceptions needing action ----
   // ---- commission pay control ----
   const pay = useMemo(() => {
     const btPaidUs = sum(recs.map((r) => r.paid));
@@ -3201,41 +3331,71 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab }) 
 
       <div className="two" style={{ marginTop: 14 }}>
         <div className="panel">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <h2 style={{ margin: 0 }}>Exceptions requiring action</h2>
-            <button className="btn" onClick={() => setTab("exceptions")}>View all →</button>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+            <h2 style={{ margin: 0 }}>Flagged orders from payroll updates <span className="sub">({flagged.length})</span></h2>
+            {flagged.length > 0 && (
+              <button className="btn" onClick={() => downloadCSV(flagged.map((r) => ({
+                Month: periodLabel(r.mk), "Order ref": r.orderNum || "", "NetSuite ref": r.netsuiteRef || "",
+                Company: r.company || "", Partner: r.partner || "", Item: r.product || "",
+                "Status was": r.wasStatus || "", "Status now": r.status || "",
+                "Category was": r.wasCat || "", "Category now": r.cat || "",
+                "GP was": r.was ?? "", "GP now": r.now ?? "", Reason: r.reason,
+              })), "flagged-orders.csv")}>Export</button>
+            )}
           </div>
-          {exceptions.length === 0 ? <div className="empty">Nothing flagged.</div> : (
-            <div style={{ overflowX: "auto", marginTop: 10 }}>
+          {flagged.length === 0 ? (
+            <div className="empty">
+              {Object.keys(statics).length === 0
+                ? <>No month-end snapshots uploaded for this year yet — add them under <strong>Settings → Monthly Reports</strong> to see what has moved since payroll.</>
+                : "Nothing has changed since the payroll snapshots."}
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto", marginTop: 10, maxHeight: 420, overflowY: "auto" }}>
               <table>
                 <thead><tr>
-                  <th className="left">Order</th><th className="left">Company</th>
-                  <th className="num">NetSuite</th><th className="num">Cobra</th>
-                  <th className="num">Variance</th><th className="left">Reason</th>
+                  <th className="left">Order</th><th className="left">Month</th>
+                  <th className="left">Status change</th><th className="num">GP was</th>
+                  <th className="num">GP now</th><th className="num">Change</th><th className="left">Reason</th>
                 </tr></thead>
                 <tbody>
-                  {exceptions.map((r) => {
-                    const v = (r.paid || 0) - (r.expected || 0);
-                    const top = r.flags[0];
+                  {flagged.slice(0, 200).map((r, i) => {
+                    const delta = (r.now || 0) - (r.was || 0);
                     return (
-                      <tr key={r.key}>
-                        <td className="left mono">{r.orderNum || "-"}</td>
-                        <td className="left">{r.company}</td>
-                        <td className="num mono">{r.inNS ? gbp(r.expected) : "-"}</td>
-                        <td className="num mono">{r.inCobra ? gbp(r.paid) : "-"}</td>
-                        <td className={"num mono " + (Math.abs(v) < 0.005 ? "" : v > 0 ? "pos" : "neg")}>
-                          {r.inNS && r.inCobra ? gbp(v) : "-"}
-                        </td>
+                      <tr key={i} style={{ background: r.reason.includes("Removed") ? "#f7c8c2"
+                        : r.reason.includes("red") ? "#fbd5cf"
+                          : r.reason.includes("status") ? "#fde2dd"
+                            : r.reason.includes("Value") ? "#fdecea" : undefined }}>
                         <td className="left">
-                          <span className={"chip " + (top.sev === 3 ? "risk" : top.sev === 2 ? "mismatch" : "unmatched")}>
-                            {top.code.replace(/_/g, " ").toLowerCase()}
-                          </span>
+                          <div className="mono">{r.orderNum || r.netsuiteRef || "-"}</div>
+                          <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.company || "-"}</div>
+                          <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.partner || "-"}</div>
                         </td>
+                        <td className="left">{periodLabel(r.mk)}</td>
+                        <td className="left">
+                          {r.wasCat && r.wasCat !== r.cat ? (
+                            <>
+                              <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat}</span>
+                              <span style={{ margin: "0 4px", color: "#8a8aa3" }}>→</span>
+                              <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                              <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.wasStatus || "-"} → {r.status || "-"}</div>
+                            </>
+                          ) : (
+                            <>
+                              <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                              <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
+                            </>
+                          )}
+                        </td>
+                        <td className="num mono">{r.was == null ? "-" : gbp0(r.was)}</td>
+                        <td className="num mono">{gbp0(r.now)}</td>
+                        <td className={"num mono " + (delta >= 0 ? "pos" : "neg")}>{delta > 0 ? "+" : ""}{gbp0(delta)}</td>
+                        <td className="left">{r.reason}</td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
+              {flagged.length > 200 && <p className="note">Showing 200 of {flagged.length} — use Export for the full list.</p>}
             </div>
           )}
         </div>
