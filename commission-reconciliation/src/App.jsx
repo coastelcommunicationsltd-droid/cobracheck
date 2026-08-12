@@ -344,6 +344,58 @@ const sumOncePerDoc = (rows, valFn) => {
   return total;
 };
 
+// ---------- big-file storage ----------
+// Row objects repeat every column name on every row, which blows past the request size
+// limit on large exports. Store them column-wise (headers once, values as arrays) and
+// write them in chunks so no single request is too big.
+const CHUNK_ROWS = 1500;
+
+const packRows = (rows) => {
+  const cols = [];
+  const seen = new Set();
+  for (const r of rows) for (const k of Object.keys(r)) if (!seen.has(k)) { seen.add(k); cols.push(k); }
+  return { c: cols, d: rows.map((r) => cols.map((k) => (r[k] === undefined ? null : r[k]))) };
+};
+const unpackRows = (cols, data) =>
+  (data || []).map((vals) => {
+    const o = {};
+    cols.forEach((c, i) => { o[c] = vals[i]; });
+    return o;
+  });
+
+async function writeChunks(sb, prefix, data, onProgress) {
+  await sb.from("recon_datasets").delete().like("id", `${prefix}-%`);
+  const total = Math.ceil(data.length / CHUNK_ROWS) || 0;
+  for (let i = 0; i < total; i++) {
+    const slice = data.slice(i * CHUNK_ROWS, (i + 1) * CHUNK_ROWS);
+    const { error } = await sb.from("recon_datasets")
+      .upsert({ id: `${prefix}-${i}`, netsuite: { d: slice } }, { onConflict: "id" });
+    if (error) throw new Error(`chunk ${i + 1}/${total}: ${error.message}`);
+    if (onProgress) onProgress(i + 1, total);
+  }
+  return total;
+}
+
+async function readChunks(sb, prefix, count) {
+  const ids = Array.from({ length: count }, (_, i) => `${prefix}-${i}`);
+  const parts = [];
+  for (let i = 0; i < ids.length; i += 15) {
+    const { data } = await sb.from("recon_datasets").select("id,netsuite").in("id", ids.slice(i, i + 15));
+    if (data) parts.push(...data);
+  }
+  parts.sort((a, b) => Number(String(a.id).split("-").pop()) - Number(String(b.id).split("-").pop()));
+  return parts.flatMap((p) => p.netsuite?.d || []);
+}
+
+// meta -> full { sheet, name, rows }. Understands both the old and the chunked format.
+async function hydrate(sb, meta, prefix) {
+  if (!meta) return null;
+  if (Array.isArray(meta.rows)) return meta;                       // old single-row format
+  if (!meta.c || !meta.n) return { ...meta, rows: [] };
+  const data = await readChunks(sb, prefix, meta.n);
+  return { sheet: meta.sheet, name: meta.name, rows: unpackRows(meta.c, data) };
+}
+
 const groupBy = (rows, keyFn) => {
   const m = new Map();
   for (const r of rows) {
@@ -676,6 +728,7 @@ export default function ReconciliationTool() {
   const [authMsg, setAuthMsg] = useState(null);
   const [sharedMeta, setSharedMeta] = useState(null);
   const [saving, setSaving] = useState(false);
+  const [saveProgress, setSaveProgress] = useState(null);
   const [period, setPeriod] = useState("all");
   const [isAdmin, setIsAdmin] = useState(false);
   const [users, setUsers] = useState([]);
@@ -874,7 +927,12 @@ export default function ReconciliationTool() {
         .from("recon_datasets").select("*").eq("id", "current").maybeSingle();
       if (cancelled || error || !data) return;
       const next = {};
-      for (const k of ["cobra", "netsuite", "sch5"]) if (data[k]) next[k] = data[k];
+      for (const k of ["cobra", "netsuite", "sch5"]) {
+        if (!data[k]) continue;
+        const full = await hydrate(supabase, data[k], `chunk-current-${k}`);
+        if (full) next[k] = full;
+      }
+      if (cancelled) return;
       // never clobber a file the user has just uploaded while this was loading
       if (Object.keys(next).length) setFiles((f) => {
         const merged = { ...f };
@@ -928,18 +986,31 @@ export default function ReconciliationTool() {
     if (!supabase || !session) return;
     setSaving(true);
     setErrors((e) => ({ ...e, save: null }));
-    const payload = {
-      id: "current",
-      cobra: slimFileForSave(nextFiles.cobra, "cobra"),
-      netsuite: slimFileForSave(nextFiles.netsuite, "netsuite"),
-      sch5: slimFileForSave(nextFiles.sch5, "sch5"),
-      uploaded_by: session.user?.email || null,
-      uploaded_at: new Date().toISOString(),
-    };
-    const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
+    setSaveProgress(null);
+    try {
+      const payload = {
+        id: "current",
+        uploaded_by: session.user?.email || null,
+        uploaded_at: new Date().toISOString(),
+      };
+      for (const which of ["cobra", "netsuite", "sch5"]) {
+        const slim = slimFileForSave(nextFiles[which], which);
+        if (!slim) { payload[which] = null; continue; }
+        const packed = packRows(slim.rows);
+        const n = await writeChunks(supabase, `chunk-current-${which}`, packed.d,
+          (done, total) => setSaveProgress(`${which} — part ${done} of ${total}`));
+        payload[which] = { sheet: slim.sheet, name: slim.name, c: packed.c, n, count: slim.rows.length };
+      }
+      setSaveProgress("finishing");
+      const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
+      if (error) throw new Error(error.message);
+      setSharedMeta({ by: payload.uploaded_by, at: payload.uploaded_at });
+      setErrors((e) => ({ ...e, save: null }));
+    } catch (err) {
+      setErrors((e) => ({ ...e, save: "Couldn't save: " + (err.message || err) }));
+    }
+    setSaveProgress(null);
     setSaving(false);
-    if (error) setErrors((e) => ({ ...e, save: "Couldn't save: " + error.message }));
-    else { setSharedMeta({ by: payload.uploaded_by, at: payload.uploaded_at }); setErrors((e) => ({ ...e, save: null })); }
   }, [session]);
 
   const onFile = useCallback(async (which, file) => {
@@ -1181,7 +1252,7 @@ export default function ReconciliationTool() {
         {tab === "settings" && (
           <Settings
             files={files} errors={errors} onFile={onFile} supabase={supabase} session={session}
-            saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded}
+            saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} saveProgress={saveProgress}
             isAdmin={isAdmin} users={users} newUser={newUser} setNewUser={setNewUser}
             addUser={addUser} removeUser={removeUser} userMsg={userMsg}
             settings={settings} saveSettings={saveSettings} settingsSaving={settingsSaving}
@@ -1506,7 +1577,7 @@ function RawTable({ f }) {
   );
 }
 
-function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded }) {
+function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded, saveProgress }) {
   const [open, setOpen] = useState({});
   const sources = [
     ["cobra", "Cobra", "What BT actually paid"],
@@ -1544,7 +1615,7 @@ function RawData({ files, errors, onFile, supabase, session, saving, sharedMeta,
               {saving ? "Saving…" : "Save & share"}
             </button>
             <span className="sub" style={{ margin: 0 }}>
-              {saving ? "Storing the data — a few seconds."
+              {saving ? (saveProgress ? `Storing the data — ${saveProgress}…` : "Storing the data…")
                 : sharedMeta?.at ? `Saved. Shared with everyone signed in (last: ${new Date(sharedMeta.at).toLocaleString("en-GB")}).`
                   : "Load your files, then click Save & share once."}
             </span>
@@ -1905,8 +1976,10 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
       if (cancelled || !data) return;
       const out = {};
       for (const r of data) {
+        if (cancelled) return;
         const mk = String(r.id).replace("static-", "");
-        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+        const full = await hydrate(supabase, r.netsuite, `chunk-${r.id}`);
+        if (full?.rows) out[mk] = full.rows.map(nsRow);
       }
       setStatics(out);
     })();
@@ -1950,8 +2023,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
   // ---- formulas ----
   const n0 = (v) => (v == null ? 0 : v);
   const netVsLatest = keys.map((_, i) => n0(netOrig[i]) - rep.latestStats[i]);
-  const changeToPayroll = keys.map((_, i) => pct(n0(latestPayroll[i]), n0(netOrig[i])));
-  const changeInValue = keys.map((_, i) => n0(netOrig[i]) - n0(latestPayroll[i]));
+  const changeToPayroll = keys.map((_, i) => n0(origPayroll[i]) - rep.latestStats[i]);
   const cancelled = keys.map((_, i) => pct(netVsLatest[i], n0(netOrig[i])));
   const paidPct = keys.map((_, i) => pct(rep.paidCobra[i], rep.latestStats[i]));
 
@@ -1960,7 +2032,6 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
   const cellNum = (v) => (v == null ? "-" : gbp0(v));
 
   const totalPct = {
-    "Change From Original to Payroll": pct(tot(latestPayroll), tot(netOrig)),
     "How Much Cancelled?": pct(tot(netVsLatest), tot(netOrig)),
     "How much has been paid?": pct(tot(rep.paidCobra), tot(rep.latestStats)),
   };
@@ -2083,8 +2154,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
               <Row label="O/S unpaid WIP" tag="Report" vals={rep.unpaidWip} />
               <Row group label="Pillar Bonus & Incentives" tag="Manual" kind="input" rowKey="pillar" vals={pillar} />
               <Row label="Accelerator Uplift" tag="Manual" kind="input" rowKey="accUplift" vals={accUplift} />
-              <Row group label="Change From Original to Payroll" tag="Formula" kind="pct" vals={changeToPayroll} />
-              <Row label="Change in Value" tag="Formula" vals={changeInValue} />
+              <Row group label="Change From Original to Payroll" tag="Formula" vals={changeToPayroll} />
               <Row group label="How Much Cancelled?" tag="Formula" kind="pct" vals={cancelled} danger={(v) => v >= 20} />
               <Row label="How much has been paid?" tag="Formula" kind="pct" vals={paidPct} />
               <Row group label="Accelerator Owed" tag="Report" vals={rep.accOwed} />
@@ -2101,7 +2171,7 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
           {diag.nsOther > 0 ? ` and ${diag.nsOther} sit in other years` : ""}.
         </p>
         <p className="note">
-          Net Vs Latest Diff = Net Original − Latest stats · Change in Value = Net Original − Latest Payroll ·
+          Net Vs Latest Diff = Net Original − Latest stats · Change From Original to Payroll = Original Payroll stats GP − Latest stats ·
           How Much Cancelled = Net Vs Latest Diff ÷ Net Original · How much has been paid = Paid on Cobra ÷ Latest stats ·
           Overage = Paid on Cobra − Latest stats.
           <br /><strong>Original Payroll stats GP</strong> comes from the static month-end snapshots uploaded under
@@ -2263,8 +2333,10 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
       if (cancelled || !data) return;
       const out = {};
       for (const r of data) {
+        if (cancelled) return;
         const mk = String(r.id).replace("static-", "");
-        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+        const full = await hydrate(supabase, r.netsuite, `chunk-${r.id}`);
+        if (full?.rows) out[mk] = full.rows.map(nsRow);
       }
       setStatics(out);
     })();
@@ -2847,7 +2919,7 @@ const riskChip = (lvl) => {
 
 function Settings(props) {
   const { files, errors, onFile, supabase, session, saving, sharedMeta, saveShared, anyLoaded,
-    isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg,
+    isAdmin, users, newUser, setNewUser, addUser, removeUser, userMsg, saveProgress,
     settings, saveSettings, settingsSaving, records, staffNames = [], staff = {}, loadStaff,
     webosStatuses = { list: [], status: 'idle' }, probe = { status: 'idle', found: [] }, probeTables,
     statusConfig = { rows: [], status: 'idle', cols: {} }, managers = {}, statusRules = {} } = props;
@@ -3154,7 +3226,7 @@ function Settings(props) {
 
       {sub === "rawdata" && (
         <RawData files={files} errors={errors} onFile={onFile} supabase={supabase}
-          session={session} saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} />
+          session={session} saving={saving} sharedMeta={sharedMeta} saveShared={saveShared} anyLoaded={anyLoaded} saveProgress={saveProgress} />
       )}
 
       {sub === "users" && isAdmin && (
@@ -3291,8 +3363,10 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
       if (cancelled || !data) return;
       const out = {};
       for (const r of data) {
+        if (cancelled) return;
         const mk = String(r.id).replace("static-", "");
-        if (r.netsuite?.rows) out[mk] = r.netsuite.rows.map(nsRow);
+        const full = await hydrate(supabase, r.netsuite, `chunk-${r.id}`);
+        if (full?.rows) out[mk] = full.rows.map(nsRow);
       }
       setStatics(out);
     })();
@@ -3708,7 +3782,7 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
       const out = {};
       for (const r of data) {
         const mk = String(r.id).replace("static-", "");
-        if (r.netsuite) out[mk] = { ...r.netsuite, at: r.uploaded_at, by: r.uploaded_by };
+        if (r.netsuite) out[mk] = { ...r.netsuite, rows: null, at: r.uploaded_at, by: r.uploaded_by, count: r.netsuite.count ?? (r.netsuite.rows || []).length };
       }
       setSaved(out);
     })();
@@ -3721,8 +3795,12 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
     try {
       const parsed = await parseWorkbook(file);
       const slim = slimFileForSave({ sheet: parsed.sheet, name: file.name, rows: parsed.rows }, "netsuite");
+      const packed = packRows(slim.rows);
+      const n = await writeChunks(supabase, `chunk-${rowId(mk)}`, packed.d,
+        (done, total) => setMsg({ err: false, text: `${periodLabel(mk)} — saving part ${done} of ${total}…` }));
       const payload = {
-        id: rowId(mk), netsuite: slim,
+        id: rowId(mk),
+        netsuite: { sheet: slim.sheet, name: slim.name, c: packed.c, n, count: slim.rows.length },
         uploaded_by: session?.user?.email || null, uploaded_at: new Date().toISOString(),
       };
       const { error } = await supabase.from("recon_datasets").upsert(payload, { onConflict: "id" });
@@ -3739,6 +3817,7 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
 
   const removeSnapshot = useCallback(async (mk) => {
     if (!supabase) return;
+    await supabase.from("recon_datasets").delete().like("id", `chunk-${rowId(mk)}-%`);
     await supabase.from("recon_datasets").delete().eq("id", rowId(mk));
     setSaved((sv) => { const n = { ...sv }; delete n[mk]; return n; });
   }, []);
@@ -3852,7 +3931,7 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
                 return (
                   <tr key={mk} style={{ background: compare === mk ? "#efeaff" : undefined }}>
                     <td className="left"><strong>{MONTHS_FY[i][1]}</strong> <span className="sub">{mk}</span></td>
-                    <td className="num mono">{sv ? sv.rows?.length ?? 0 : "-"}</td>
+                    <td className="num mono">{sv ? (sv.count ?? sv.rows?.length ?? 0) : "-"}</td>
                     <td className="left sub">{sv?.at ? `${new Date(sv.at).toLocaleDateString("en-GB")} · ${sv.by || ""}` : "not uploaded"}</td>
                     <td className="num">
                       <label className="file" style={{ fontSize: 11, padding: "5px 9px" }}>
