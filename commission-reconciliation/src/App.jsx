@@ -669,8 +669,6 @@ export default function ReconciliationTool() {
   const [staff, setStaff] = useState({ rows: [], status: "idle", planCol: null });
   // tracks which slots the user has replaced in this session, so a late DB read can't overwrite them
   const uploadedHere = useRef({});
-  const snapshot = settings.snapshot || null;
-  const saveSnapshot = useCallback((snap) => saveSettings({ ...settings, snapshot: snap }), [settings, saveSettings]);
 
   const EXCLUDED_MANAGER = "tracy webber";
 
@@ -757,6 +755,9 @@ export default function ReconciliationTool() {
     );
     setSettingsSaving(false);
   }, [session]);
+
+  const snapshot = settings.snapshot || null;
+  const saveSnapshot = useCallback((snap) => saveSettings({ ...settings, snapshot: snap }), [settings, saveSettings]);
 
   // track the logged-in session
   useEffect(() => {
