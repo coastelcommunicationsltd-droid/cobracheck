@@ -1148,23 +1148,9 @@ export default function ReconciliationTool() {
     ["cross", "Cross-Reference", "⇄"],
     ["wip", "Cobra Dashboard", "▦"],
     ["agents", "Payroll", "◫"],
-    ["btpay", "BT Payments", "£"],
-    ["exceptions", "Exceptions", "⚠"],
-    ["obi", "OBI Checks", "☑"],
-    ["reconcile", "Reconciliation", "⚖"],
     ["settings", "Settings", "⚙"],
   ];
 
-  const TABS = [
-    ["cross", "Cross-Reference"],
-    ["wip", "Cobra Dashboard"],
-    ["agents", "Payments Per Agent"],
-    ["btpay", "BT Payment Check"],
-    ["exceptions", "Exceptions & Risk"],
-    ["obi", "OBI Checks"],
-    ["reconcile", "Reconciliation"],
-    ["settings", "Settings"],
-  ];
 
   return (
     <div className="recon">
@@ -1283,133 +1269,6 @@ export default function ReconciliationTool() {
               managers={staffManagers} statusRules={effectiveStatusRules} supabase={supabase} session={session} />}
 
             {/* RECONCILIATION */}
-            {tab === "reconcile" && (
-              <div className="panel">
-                <h2>Order-level reconciliation — Cobra vs NetSuite</h2>
-                {result.records.length === 0 ? (
-                  <div className="empty">Nothing to show yet.</div>
-                ) : (
-                  <div style={{ overflowX: "auto" }}>
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Order #</th><th>Customer</th><th>Sources</th>
-                          <th className="num">Expected</th><th className="num">Paid (Cobra)</th>
-                          <th className="num">Δ pay</th><th>Status</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {result.records.map((r) => (
-                          <Fragment key={r.key}>
-                            <tr className="click" onClick={() => toggle(r.key)}>
-                              <td className="mono">{r.orderNum || "—"}</td>
-                              <td className="left">{r.company}</td>
-                              <td><Presence ns={r.inNS} cb={r.inCobra} s5={r.inSch5} /></td>
-                              <td className="num mono">{gbp(r.expected)}</td>
-                              <td className="num mono">{gbp(r.paid)}</td>
-                              <td><Delta v={r.payDelta} /></td>
-                              <td>
-                                <span className={"chip " + r.matchState}>{r.matchState}</span>
-                                {r.flags.some((f) => f.sev === 3) && <span className="chip risk" style={{ marginLeft: 4 }}>risk</span>}
-                              </td>
-                            </tr>
-                            {expanded.has(r.key) && (
-                              <tr><td colSpan={7}><LineDetail r={r} /></td></tr>
-                            )}
-                          </Fragment>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-                <p className="note">Click any row for the underlying lines. N/C/S = present in NetSuite / Cobra / Sch5.</p>
-              </div>
-            )}
-
-            {/* BT PAYMENT CHECK */}
-            {tab === "btpay" && (
-              <div className="panel">
-                <h2>Did BT pay correctly — and is NetSuite's record accurate?</h2>
-                <p className="note" style={{ marginTop: 0, marginBottom: 12 }}>
-                  <strong>Paid vs Due</strong> = did BT pay what Cobra says is owed · <strong>Paid vs Expected</strong> = did BT pay what we expected ·
-                  <strong> NS record</strong> = does NetSuite's "Cobra Payment" match what Cobra actually shows.
-                </p>
-                <div style={{ overflowX: "auto" }}>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Order #</th><th>Customer</th>
-                        <th className="num">Due (Cobra)</th><th className="num">Paid (Cobra)</th><th className="num">Paid−Due</th>
-                        <th className="num">Expected (NS)</th><th className="num">Paid−Exp</th>
-                        <th className="num">NS record</th><th className="num">vs actual</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {result.records.filter((r) => r.inCobra).map((r) => (
-                        <tr key={r.key}>
-                          <td className="left mono">{r.orderNum}</td>
-                          <td className="left">{r.company}</td>
-                          <td className="num mono">{gbp(r.due)}</td>
-                          <td className="num mono">{gbp(r.paid)}</td>
-                          <td><Delta v={r.dueVsPaid} /></td>
-                          <td className="num mono">{r.inNS ? gbp(r.expected) : "—"}</td>
-                          <td><Delta v={r.payDelta} /></td>
-                          <td className="num mono">{r.inNS ? gbp(r.recordedCobra) : "—"}</td>
-                          <td><Delta v={r.recordDelta} /></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {result.records.filter((r) => r.inCobra).length === 0 && <div className="empty">Load a Cobra export to run payment checks.</div>}
-              </div>
-            )}
-
-            {/* EXCEPTIONS */}
-            {tab === "exceptions" && (
-              <div className="panel">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <h2 style={{ margin: 0 }}>Mismatches, missing payments & financial risk</h2>
-                  <button className="btn" onClick={() => downloadCSV(
-                    result.records.filter((r) => r.flags.length).flatMap((r) =>
-                      r.flags.map((f) => ({ order: r.orderNum, customer: r.company, severity: f.sev, code: f.code, detail: f.msg, expected: r.expected, paid: r.paid }))
-                    ), "reconciliation-exceptions.csv")}>Export CSV</button>
-                </div>
-                <div style={{ marginTop: 14 }}>
-                  {result.records.filter((r) => r.flags.length).length === 0 ? (
-                    <div className="empty">No exceptions found — everything within tolerance.</div>
-                  ) : (
-                    result.records.filter((r) => r.flags.length).map((r) =>
-                      r.flags.map((f, i) => (
-                        <div key={r.key + i} className={"exc s" + f.sev}>
-                          <div className="top">
-                            <span className="code">{f.code}</span>
-                            <span className="meta mono">{r.orderNum} · {r.company}</span>
-                          </div>
-                          <div className="msg">{f.msg}</div>
-                        </div>
-                      ))
-                    )
-                  )}
-                </div>
-              </div>
-            )}
-
-            {/* OBI CHECKS */}
-            {tab === "obi" && (
-              <div className="panel">
-                <h2>OBI checks (Sch5-driven)</h2>
-                <div className="banner info">
-                  These are sensible default checks built from the Sch5 feed to support Tommy's process.
-                  Send Tommy's actual OBI checklist and I'll wire these to match it exactly.
-                </div>
-                {!files.sch5 ? (
-                  <div className="empty">Load a Sch5 export to run OBI checks.</div>
-                ) : (
-                  <ObiChecks records={result.records} />
-                )}
-              </div>
-            )}
           </>
         )}
 
@@ -2036,32 +1895,9 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
     "How much has been paid?": pct(tot(rep.paidCobra), tot(rep.latestStats)),
   };
 
-  const Row = ({ label, tag, vals, kind, rowKey, danger, group }) => (
-    <tr className={group ? "grp" : ""}>
-      <td className="left lbl" style={{ whiteSpace: "nowrap" }}>
-        <span className={"chip " + (tag === "Formula" ? "mismatch" : tag === "Report" ? "matched" : "unmatched")}
-          style={{ marginRight: 8, fontSize: 10 }}>{tag}</span>
-        <strong>{label}</strong>
-      </td>
-      {vals.map((v, i) => (
-        <td key={i} className="num mono"
-          onClick={tag === "Report" ? () => setDrill({ label, monthIndex: i }) : undefined}
-          title={tag === "Report" ? "Click to see the orders behind this figure" : undefined}
-          style={{
-          cursor: tag === "Report" ? "pointer" : undefined,
-          textDecoration: tag === "Report" && v ? "underline dotted" : undefined,
-          background: drill && drill.label === label && drill.monthIndex === i ? "#efeaff"
-            : danger && v != null && danger(v) ? "#fbe9e7" : undefined,
-          color: danger && v != null && danger(v) ? "#b3261e" : undefined,
-        }}>
-          {kind === "input" ? (
-            <input type="number" value={manual[rowKey]?.[i] ?? ""} placeholder="-"
-              onChange={(e) => setM(rowKey, i, e.target.value)} />
-          ) : kind === "pct" ? fmtPct(v) : cellNum(v)}
-        </td>
-      ))}
-      <td className="num mono tot">{kind === "pct" ? fmtPct(totalPct[label]) : gbp0(tot(vals))}</td>
-    </tr>
+  const Row = (props) => (
+    <WipRow {...props} manual={manual} setM={setM} drill={drill} setDrill={setDrill}
+      totalPct={totalPct} tot={tot} />
   );
 
   // unpaid WIP split by product group, for the summary strip
@@ -2255,6 +2091,48 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
 // =========================================================================
 // Total = everything except red. Payable = payable tone. Waiting = claimed + issued.
 // export files often carry a totals/summary row with no identifiers — never treat it as an order
+// Match a snapshot line to a live line on order reference + company name.
+// The old key used Document Number and item text, which change between exports and made
+// almost everything look "no longer on the report".
+const matchKey = (r) => {
+  const ord = normOrder(r.orderNum || r.netsuiteRef || "");
+  const co = String(r.company || "").trim().toLowerCase().replace(/\s+/g, " ");
+  return ord ? `o:${ord}` : co ? `c:${co}` : null;
+};
+
+// Compare a snapshot bucket against a live bucket and describe what moved.
+function buildDiff(snap, live, catOf) {
+  const rows = [];
+  for (const [k, b] of live) {
+    const a = snap.get(k);
+    const nowCat = catOf(b);
+    if (!a) {
+      rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new",
+        was: null, now: b.gp, becamePayable: nowCat === "payable", lostPayable: false });
+      continue;
+    }
+    const wasCat = catOf(a);
+    const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
+    const catMoved = wasCat !== nowCat;
+    const statusMoved = String(a.status || "") !== String(b.status || "");
+    rows.push({
+      ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
+      becamePayable: wasCat !== "payable" && nowCat === "payable",
+      lostPayable: wasCat === "payable" && nowCat !== "payable",
+      change: valueMoved && (catMoved || statusMoved) ? "value+status"
+        : valueMoved ? "value"
+          : catMoved ? "status"
+            : statusMoved ? "status-only" : null,
+    });
+  }
+  for (const [k, a] of snap) {
+    if (live.has(k)) continue;
+    rows.push({ ...a, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
+      change: "removed", was: a.gp, now: 0, becamePayable: false, lostPayable: catOf(a) === "payable" });
+  }
+  return rows;
+}
+
 const isRealLine = (r) =>
   !!(String(r.netsuiteRef || "").trim() || String(r.orderNum || "").trim() || String(r.company || "").trim());
 
@@ -2271,6 +2149,25 @@ const summariseGp = (rows, statusRules) => {
   }
   return { total, payable, waiting };
 };
+
+function NumInput({ value, placeholder, onCommit, style }) {
+  const [v, setV] = useState(value ?? "");
+  useEffect(() => { setV(value ?? ""); }, [value]);
+  return (
+    <input
+      type="number" value={v} placeholder={placeholder}
+      onChange={(e) => setV(e.target.value)}
+      onBlur={() => { if (String(v) !== String(value ?? "")) onCommit(v); }}
+      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+      onPaste={(e) => {
+        const t = (e.clipboardData || window.clipboardData).getData("text");
+        const n = t.replace(/[^0-9.\-]/g, "");
+        if (n !== t) { e.preventDefault(); setV(n); }
+      }}
+      style={style}
+    />
+  );
+}
 
 const blankAgent = (n) => ({
   earned: Array(n).fill(0), payable: Array(n).fill(0), claimed: Array(n).fill(0),
@@ -2343,7 +2240,6 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     return () => { cancelled = true; };
   }, [session, year, keys.join()]);
 
-  const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
 
   // what payroll saw, per agent per month
   const staticByAgent = useMemo(() => {
@@ -2364,59 +2260,56 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     return out;
   }, [statics, keys.join(), statusRules]);
 
-  // per agent+month: what has moved since the static snapshot
-  const changesFor = useCallback((agent, i) => {
-    const mk = keys[i];
-    const snapRows = statics[mk];
-    if (!snapRows) return null;
+  // Every agent+month compared in a single pass — rebuilding this per cell was the
+  // main reason the page crawled.
+  const allChanges = useMemo(() => {
+    const out = new Map();
+    if (!Object.keys(statics).length) return out;
     const catOf = (r) => (isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status));
-    const mine = (r) => (r.partner || r.agent || "(unassigned)") === agent;
-    const snap = new Map();
-    for (const r of snapRows) {
-      if (!mine(r) || !isRealLine(r)) continue;
-      const k = lineKey(r);
-      if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
-      snap.get(k).gp += r.expected || 0;
-    }
-    const live = new Map();
+    const agentOf = (r) => r.partner || r.agent || "(unassigned)";
+
+    // bucket the live report once: agent|monthIndex -> Map(matchKey -> aggregated line)
+    const liveBy = new Map();
     for (const r of ns) {
-      if (r.period !== mk || !mine(r) || !isRealLine(r)) continue;
-      const k = lineKey(r);
-      if (!live.has(k)) live.set(k, { ...r, gp: 0 });
-      live.get(k).gp += r.expected || 0;
+      const i = idx.get(r.period);
+      if (i == null || !isRealLine(r)) continue;
+      const k = matchKey(r);
+      if (!k) continue;
+      const bk = `${agentOf(r)}|${i}`;
+      if (!liveBy.has(bk)) liveBy.set(bk, new Map());
+      const m = liveBy.get(bk);
+      if (!m.has(k)) m.set(k, { ...r, gp: 0 });
+      m.get(k).gp += r.expected || 0;
     }
-    const rows = [];
-    for (const [k, b] of live) {
-      const a = snap.get(k);
-      const nowCat = catOf(b);
-      if (!a) {
-        rows.push({ ...b, cat: nowCat, wasCat: null, wasStatus: "(not in payroll)", change: "new", was: null, now: b.gp,
-          becamePayable: nowCat === "payable", lostPayable: false });
-        continue;
+
+    const snapBy = new Map();
+    keys.forEach((mk, i) => {
+      for (const r of statics[mk] || []) {
+        if (!isRealLine(r)) continue;
+        const k = matchKey(r);
+        if (!k) continue;
+        const bk = `${agentOf(r)}|${i}`;
+        if (!snapBy.has(bk)) snapBy.set(bk, new Map());
+        const m = snapBy.get(bk);
+        if (!m.has(k)) m.set(k, { ...r, gp: 0 });
+        m.get(k).gp += r.expected || 0;
       }
-      const wasCat = catOf(a);
-      const valueMoved = Math.abs((a.gp || 0) - (b.gp || 0)) > 0.005;
-      const catMoved = wasCat !== nowCat;
-      const statusMoved = String(a.status || "") !== String(b.status || "");
-      const becamePayable = wasCat !== "payable" && nowCat === "payable";
-      const lostPayable = wasCat === "payable" && nowCat !== "payable";
-      rows.push({
-        becamePayable, lostPayable,
-        ...b, cat: nowCat, wasCat, wasStatus: a.status, was: a.gp, now: b.gp,
-        change: valueMoved && (catMoved || statusMoved) ? "value+status"
-          : valueMoved ? "value"
-            : catMoved ? "status"
-              : statusMoved ? "status-only" : null,
-      });
+    });
+
+    const bucketKeys = new Set([...liveBy.keys(), ...snapBy.keys()]);
+    for (const bk of bucketKeys) {
+      const i = Number(bk.split("|").pop());
+      if (!statics[keys[i]]) continue;               // no snapshot for that month
+      const snap = snapBy.get(bk) || new Map();
+      const live = liveBy.get(bk) || new Map();
+      const rows = buildDiff(snap, live, catOf);
+      out.set(bk, rows);
     }
-    for (const [k, a] of snap) {
-      if (live.has(k)) continue;
-      rows.push({ ...a, wasCat: catOf(a), wasStatus: a.status, cat: null, status: "(not in live report)",
-        change: "removed", was: a.gp, now: 0,
-        becamePayable: false, lostPayable: catOf(a) === "payable" });
-    }
-    return rows;
-  }, [statics, ns, keys.join(), statusRules]);
+    return out;
+  }, [statics, ns, keys.join(), statusRules, idx]);
+
+  const changesFor = useCallback((agent, i) =>
+    (statics[keys[i]] ? (allChanges.get(`${agent}|${i}`) || []) : null), [allChanges, statics, keys.join()]);
 
   const [drill, setDrill] = useState(null);   // { agent, i }
   const [drillFilter, setDrillFilter] = useState("all");   // all | gained | lost
@@ -2492,18 +2385,17 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     const blank = keys.map(() => ({ gained: 0, lost: 0, nGained: 0, nLost: 0 }));
     if (!Object.keys(statics).length) return null;
     const allow = new Set(shownAgents.map(([n]) => n));
-    for (const [name] of shownAgents) {
-      keys.forEach((mk, i) => {
-        if (!statics[mk]) return;
-        const rows = changesFor(name, i) || [];
-        for (const r of rows) {
-          if (r.becamePayable) { blank[i].gained += r.now || 0; blank[i].nGained++; }
-          if (r.lostPayable) { blank[i].lost += r.was || 0; blank[i].nLost++; }
-        }
-      });
+    for (const [bk, rows] of allChanges) {
+      const parts = bk.split("|");
+      const i = Number(parts.pop());
+      if (!allow.has(parts.join("|"))) continue;
+      for (const r of rows) {
+        if (r.becamePayable) { blank[i].gained += r.now || 0; blank[i].nGained++; }
+        if (r.lostPayable) { blank[i].lost += r.was || 0; blank[i].nLost++; }
+      }
     }
     return blank;
-  }, [shownAgents, statics, keys.join(), changesFor]);
+  }, [shownAgents, statics, keys.join(), allChanges]);
 
   const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
 
@@ -3184,8 +3076,8 @@ function Settings(props) {
                         <td className="left">{a2}</td>
                         <td className="left sub">{managers[a2] || "-"}</td>
                         <td className="num">
-                          <input type="number" value={payplans[a2] ?? ""} placeholder={dbPlans[a2] ? String(dbPlans[a2]) : "-"}
-                            onChange={(e) => saveSettings({ ...settings, payplans: { ...payplans, [a2]: e.target.value === "" ? "" : Number(e.target.value) } })}
+                          <NumInput value={payplans[a2] ?? ""} placeholder={dbPlans[a2] ? String(dbPlans[a2]) : "-"}
+                            onCommit={(nv) => saveSettings({ ...settings, payplans: { ...payplans, [a2]: nv === "" ? "" : Number(nv) } })}
                             style={{ width: 90, padding: "4px 6px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 12, textAlign: "center" }} />
                         </td>
                         {MONTHS_FY.map((_, i) => {
@@ -3194,13 +3086,13 @@ function Settings(props) {
                           const planNm = (staff.planNames || {})[a2]?.[mk];
                           return (
                           <td key={i} className="num" title={planNm ? `Plan: ${planNm}` : undefined}>
-                            <input type="number" value={months[i] ?? ""}
+                            <NumInput value={months[i] ?? ""}
                               placeholder={fromDb != null ? String(fromDb) : (std === "" ? "-" : String(std))}
-                              onChange={(e) => {
+                              onCommit={(nv) => {
                                 const next = JSON.parse(JSON.stringify(settings.payplanMonthly || {}));
                                 next[planYear] = next[planYear] || {};
                                 next[planYear][a2] = next[planYear][a2] || [];
-                                next[planYear][a2][i] = e.target.value === "" ? "" : Number(e.target.value);
+                                next[planYear][a2][i] = nv === "" ? "" : Number(nv);
                                 saveSettings({ ...settings, payplanMonthly: next });
                               }}
                               style={{ width: 74, padding: "4px 5px", border: "1px solid #e2e0ee", borderRadius: 5,
@@ -3375,8 +3267,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
 
   const flagged = useMemo(() => {
     if (cYear == null) return [];
-    const lineKey = (r) => `${r.netsuiteRef || ""}|${r.orderNum || ""}|${r.product || ""}|${r.partner || ""}`;
-
+  
     const catOf = (r) => (isNonCommissionable(r) ? "red" : statusCategory(statusRules, r.status));
     const out = [];
     for (const mk of fyMonthKeys(cYear)) {
@@ -3385,14 +3276,16 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
       const snap = new Map();
       for (const r of snapRows) {
         if (!isRealLine(r)) continue;
-        const k = lineKey(r);
+        const k = matchKey(r);
+        if (!k) continue;
         if (!snap.has(k)) snap.set(k, { ...r, gp: 0 });
         snap.get(k).gp += r.expected || 0;
       }
       const live = new Map();
       for (const r of ns) {
         if (r.period !== mk || !isRealLine(r)) continue;
-        const k = lineKey(r);
+        const k = matchKey(r);
+        if (!k) continue;
         if (!live.has(k)) live.set(k, { ...r, gp: 0 });
         live.get(k).gp += r.expected || 0;
       }
@@ -3442,8 +3335,7 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
   // ---- commission pay control ----
   const pay = useMemo(() => {
     const btPaidUs = sum(recs.map((r) => r.paid));
-    const entitled = sum(recs.map((r) => r.netGp));
-    return { btPaidUs, entitled };
+    return { btPaidUs };
   }, [recs]);
 
   const changes = useMemo(() => {
@@ -3694,18 +3586,24 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
             <h2>Commission pay control</h2>
             <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 8 }}>
               <div className="step"><span className="n">1</span>
-                <div><div className="sub" style={{ margin: 0 }}>BT paid us</div>
-                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.btPaidUs)}</strong></div>
+                <div><div className="sub" style={{ margin: 0 }}>Total payable GP</div>
+                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(catTotals.payable)}</strong></div>
               </div>
               <span style={{ color: "#c9c6da" }}>›</span>
               <div className="step"><span className="n">2</span>
-                <div><div className="sub" style={{ margin: 0 }}>Agents entitled</div>
-                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.entitled)}</strong></div>
+                <div><div className="sub" style={{ margin: 0 }}>Total paid from BT</div>
+                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.btPaidUs)}</strong></div>
+              </div>
+              <span style={{ color: "#c9c6da" }}>›</span>
+              <div className="step"><span className="n">3</span>
+                <div><div className="sub" style={{ margin: 0 }}>Remaining to be paid</div>
+                  <strong className="mono" style={{ fontSize: 16, color: catTotals.payable - pay.btPaidUs > 0 ? "#b3261e" : "#14804a" }}>
+                    {gbp0(catTotals.payable - pay.btPaidUs)}
+                  </strong></div>
               </div>
             </div>
             <p className="note">
-              Entitled = Net GP (excludes Red GP statuses and non-commissionable lines).
-              A third step — what we actually paid out — needs a payroll figure; see the note below.
+              Payable GP uses the tone categories; paid comes from Cobra's Commission Paid.
             </p>
           </div>
 
@@ -3972,5 +3870,37 @@ function MonthlyReports({ supabase, session, files, statusRules }) {
         </>
       )}
     </>
+  );
+}
+
+// Row of the Cobra Dashboard grid. Kept outside WipTracker so React reuses it between
+// renders — otherwise every keystroke remounts the row and the input loses focus.
+function WipRow({ label, tag, vals, kind, rowKey, danger, group, manual, setM, drill, setDrill, totalPct, tot }) {
+  const cellNum = (v) => (v == null ? "-" : gbp0(v));
+  return (
+    <tr className={group ? "grp" : ""}>
+      <td className="left lbl" style={{ whiteSpace: "nowrap" }}>
+        <span className={"chip " + (tag === "Formula" ? "mismatch" : tag === "Report" ? "matched" : "unmatched")}
+          style={{ marginRight: 8, fontSize: 10 }}>{tag}</span>
+        <strong>{label}</strong>
+      </td>
+      {vals.map((v, i) => (
+        <td key={i} className="num mono"
+          onClick={tag === "Report" ? () => setDrill({ label, monthIndex: i }) : undefined}
+          title={tag === "Report" ? "Click to see the orders behind this figure" : undefined}
+          style={{
+            cursor: tag === "Report" ? "pointer" : undefined,
+            textDecoration: tag === "Report" && v ? "underline dotted" : undefined,
+            background: drill && drill.label === label && drill.monthIndex === i ? "#efeaff"
+              : danger && v != null && danger(v) ? "#fbe9e7" : undefined,
+            color: danger && v != null && danger(v) ? "#b3261e" : undefined,
+          }}>
+          {kind === "input"
+            ? <NumInput value={manual[rowKey]?.[i] ?? ""} placeholder="-" onCommit={(nv) => setM(rowKey, i, nv)} />
+            : kind === "pct" ? fmtPct(v) : cellNum(v)}
+        </td>
+      ))}
+      <td className="num mono tot">{kind === "pct" ? fmtPct(totalPct[label]) : gbp0(tot(vals))}</td>
+    </tr>
   );
 }
