@@ -32,6 +32,7 @@ const makeSignupClient = () =>
 
 // fallback passcode — ONLY used if Supabase isn't configured yet (local testing)
 const PASSCODE = "BTLBDCSDTEST";
+const APP_VERSION = "2026-08-12-uk-dates";
 
 // ---------- helpers ----------
 const money = (v) => {
@@ -84,6 +85,8 @@ const monthKey = (v) => {
   if (m) return `${m[1]}-${m[2]}`;
   m = s.match(/^(\d{4})(\d{2})$/); // YYYYMM (e.g. 202601)
   if (m) return `${m[1]}-${m[2]}`;
+  // NOTE: a real Date object here means something already parsed the text for us,
+  // which is exactly how "12/08/2026" became December. Use it only as a last resort.
   if (v instanceof Date && !isNaN(v)) return `${v.getFullYear()}-${String(v.getMonth() + 1).padStart(2, "0")}`;
   return null;
 };
@@ -244,8 +247,10 @@ const nsRow = (r) => ({
   accelerator: firstDefined(pick(r, ["Accelerator?", "Accelerator"])),
   agent: firstDefined(pick(r, ["Admin Agent"])),
   le: normLE(pick(r, ["Customer Le", "Customer Ledger", "Customer Le "])),
-  // month comes from Netsuite Date only (or "Date" in the new report) — never another date column
-  date: firstDefined(pickExact(r, ["Netsuite Date"]), pickExact(r, ["Date"])),
+  // month comes from the "Date" column (or "Netsuite Date" on the old report) and nothing else.
+  // Values are UK format: 12/08/2026 is 12 AUGUST 2026.
+  date: firstDefined(pickExact(r, ["Date"]), pickExact(r, ["Netsuite Date"])),
+  dateCol: pickExact(r, ["Date"]) != null ? "Date" : (pickExact(r, ["Netsuite Date"]) != null ? "Netsuite Date" : null),
   productGroup2: firstDefined(pick(r, ["Item: Product Group 2"]), pick(r, ["Product Group 2", "Product Group2"])),
   netsuiteRef: firstDefined(pick(r, ["Netsuite Ref", "NetSuite Ref"]), pick(r, ["Document Number"])),
   raw: r,
@@ -905,7 +910,7 @@ export default function ReconciliationTool() {
       <div className="wrap">
         <div className="head">
           <h1>Commission <span className="accent">Reconciliation</span></h1>
-          <span className="sub" style={{ margin: 0 }}>Cobra · NetSuite · Sch5 — shared</span>
+          <span className="sub" style={{ margin: 0 }}>Cobra · NetSuite · Sch5 — shared <span className="mono" style={{ opacity: .6 }}>({APP_VERSION})</span></span>
           {session && (
             <span className="sub" style={{ marginLeft: "auto" }}>
               {session.user?.email}{" · "}
@@ -1735,6 +1740,22 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
   );
 
   // unpaid WIP split by product group, for the summary strip
+  const dateAudit = useMemo(() => {
+    const counts = new Map();
+    let col = null;
+    for (const r of ns) {
+      if (!col && r.dateCol) col = r.dateCol;
+      const raw = r.rawDate == null ? "" : String(r.rawDate);
+      if (!counts.has(raw)) counts.set(raw, { raw, n: 0, month: monthKey(r.rawDate) });
+      counts.get(raw).n++;
+    }
+    const samples = [...counts.values()].sort((a, b) => b.n - a.n).slice(0, 12);
+    // an ISO timestamp here means the value was converted to a date somewhere BEFORE we saw it
+    // (the old US month/day bug). Raw UK text like "12/08/2026" is what we want.
+    const stale = [...counts.keys()].some((k) => /^\d{4}-\d{2}-\d{2}T/.test(k));
+    return { col, samples, stale };
+  }, [ns]);
+
   const diag = useMemo(() => {
     let nsIn = 0, nsNoDate = 0, nsOther = 0;
     for (const r of ns) {
@@ -1760,6 +1781,38 @@ function WipTracker({ files, settings, saveSettings, settingsSaving }) {
 
   return (
     <>
+      <div className="panel">
+        <h2>How dates are being read</h2>
+        <p className="note" style={{ marginTop: 0 }}>
+          Column used: <strong className="mono">{dateAudit.col || "(none found)"}</strong>.
+          Read as UK day/month/year — <span className="mono">12/08/2026</span> means 12 August 2026.
+          Build <span className="mono">{APP_VERSION}</span>.
+        </p>
+        <div style={{ overflowX: "auto" }}>
+          <table>
+            <thead><tr><th className="left">Raw value in the file</th><th className="num">Rows</th><th className="num">Counted as</th></tr></thead>
+            <tbody>
+              {dateAudit.samples.map((sm, i) => (
+                <tr key={i}>
+                  <td className="left mono">{sm.raw === "" ? "(blank)" : sm.raw}</td>
+                  <td className="num mono">{sm.n}</td>
+                  <td className="num mono">{sm.month ? periodLabel(sm.month) : "not counted"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {dateAudit.stale && (
+          <div className="banner" style={{ marginTop: 12 }}>
+            <strong>These dates were already converted before they were saved.</strong> They show as timestamps
+            (e.g. 2026-12-08T00:00:00Z) rather than <span className="mono">12/08/2026</span>, which means this data was
+            stored by an older version that read UK dates the American way. Re-upload the NetSuite file on the
+            Settings → Raw Data tab and press <strong>Save &amp; share</strong> to correct the months.
+          </div>
+        )}
+        {dateAudit.samples.length === 0 && <div className="empty">No dates found in the NetSuite file.</div>}
+      </div>
+
       <div className="panel">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
           <h2 style={{ margin: 0 }}>Outstanding unpaid WIP — {fyLabel(year)}</h2>
