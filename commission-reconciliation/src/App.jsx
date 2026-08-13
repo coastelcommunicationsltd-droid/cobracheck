@@ -369,36 +369,56 @@ const unpackRows = (cols, data) =>
     return o;
   });
 
+// Run jobs N-at-a-time. Everything below used to run strictly one after another,
+// so a 20-chunk file paid 20 round trips end to end.
+async function pooled(items, limit, worker, onDone) {
+  const results = new Array(items.length);
+  let next = 0, done = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+      if (onDone) onDone(++done, items.length);
+    }
+  }));
+  return results;
+}
+
 async function writeChunks(sb, prefix, data, onProgress) {
   await sb.from("recon_datasets").delete().like("id", `${prefix}-%`);
   const total = Math.ceil(data.length / CHUNK_ROWS) || 0;
-  for (let i = 0; i < total; i++) {
+  const jobs = Array.from({ length: total }, (_, i) => i);
+  const errs = await pooled(jobs, 4, async (i) => {
     const slice = data.slice(i * CHUNK_ROWS, (i + 1) * CHUNK_ROWS);
     const { error } = await sb.from("recon_datasets")
       .upsert({ id: `${prefix}-${i}`, netsuite: { d: slice } }, { onConflict: "id" });
-    if (error) throw new Error(`chunk ${i + 1}/${total}: ${error.message}`);
-    if (onProgress) onProgress(i + 1, total);
-  }
+    return error ? `chunk ${i + 1}/${total}: ${error.message}` : null;
+  }, onProgress);
+  const bad = errs.find(Boolean);
+  if (bad) throw new Error(bad);
   return total;
 }
 
-async function readChunks(sb, prefix, count) {
+async function readChunks(sb, prefix, count, onProgress) {
   const ids = Array.from({ length: count }, (_, i) => `${prefix}-${i}`);
-  const parts = [];
-  for (let i = 0; i < ids.length; i += 15) {
-    const { data } = await sb.from("recon_datasets").select("id,netsuite").in("id", ids.slice(i, i + 15));
-    if (data) parts.push(...data);
-  }
+  const batches = [];
+  for (let i = 0; i < ids.length; i += 10) batches.push(ids.slice(i, i + 10));
+  const got = await pooled(batches, 6, async (batch) => {
+    const { data } = await sb.from("recon_datasets").select("id,netsuite").in("id", batch);
+    return data || [];
+  }, onProgress);
+  const parts = got.flat();
   parts.sort((a, b) => Number(String(a.id).split("-").pop()) - Number(String(b.id).split("-").pop()));
   return parts.flatMap((p) => p.netsuite?.d || []);
 }
 
 // meta -> full { sheet, name, rows }. Understands both the old and the chunked format.
-async function hydrate(sb, meta, prefix) {
+async function hydrate(sb, meta, prefix, onProgress) {
   if (!meta) return null;
   if (Array.isArray(meta.rows)) return meta;                       // old single-row format
   if (!meta.c || !meta.n) return { ...meta, rows: [] };
-  const data = await readChunks(sb, prefix, meta.n);
+  const data = await readChunks(sb, prefix, meta.n, onProgress);
   return { sheet: meta.sheet, name: meta.name, rows: unpackRows(meta.c, data) };
 }
 
@@ -609,6 +629,9 @@ const STYLES = `
 .legend { display:flex; gap:14px; font-size:12px; color:#5b5676; margin-bottom:6px; flex-wrap:wrap; }
 .legend i { width:10px; height:10px; border-radius:3px; display:inline-block; margin-right:5px; }
 .step { display:flex; align-items:center; gap:8px; }
+.spin { width:14px; height:14px; border-radius:50%; border:2px solid #c9c6da; border-top-color:#5514b4;
+  display:inline-block; animation:sp .7s linear infinite; }
+@keyframes sp { to { transform:rotate(360deg); } }
 .fcards { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 12px; }
 .fcard { background:#fff; border:1px solid #e7e6f0; border-top-width:3px; border-radius:10px;
   padding:8px 12px; cursor:pointer; text-align:left; min-width:104px; }
@@ -751,6 +774,7 @@ export default function ReconciliationTool() {
   const [sharedMeta, setSharedMeta] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saveProgress, setSaveProgress] = useState(null);
+  const [loadProgress, setLoadProgress] = useState(null);
   const [period, setPeriod] = useState("all");
   const [isAdmin, setIsAdmin] = useState(false);
   const [users, setUsers] = useState([]);
@@ -953,13 +977,20 @@ export default function ReconciliationTool() {
       const { data, error } = await supabase
         .from("recon_datasets").select("*").eq("id", "current").maybeSingle();
       if (cancelled || error || !data) return;
-      const next = {};
-      for (const k of ["cobra", "netsuite", "sch5"]) {
-        if (!data[k]) continue;
-        const full = await hydrate(supabase, data[k], `chunk-current-${k}`);
-        if (full) next[k] = full;
-      }
+      const wanted = ["cobra", "netsuite", "sch5"].filter((k) => data[k]);
+      const totalParts = wanted.reduce((n, k) => n + Math.ceil((data[k].n || 0) / 10), 0) || 1;
+      let doneParts = 0;
+      setLoadProgress({ done: 0, total: totalParts });
+      const loaded = await Promise.all(wanted.map((k) =>
+        hydrate(supabase, data[k], `chunk-current-${k}`, () => {
+          doneParts += 1;
+          setLoadProgress({ done: doneParts, total: totalParts });
+        })
+      ));
+      setLoadProgress(null);
       if (cancelled) return;
+      const next = {};
+      wanted.forEach((k, i) => { if (loaded[i]) next[k] = loaded[i]; });
       // never clobber a file the user has just uploaded while this was loading
       if (Object.keys(next).length) setFiles((f) => {
         const merged = { ...f };
@@ -1231,6 +1262,15 @@ export default function ReconciliationTool() {
             </span>
           )}
         </div>
+        {loadProgress && (
+          <div className="banner info" style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span className="spin" />
+            <span>
+              Loading the shared data — {loadProgress.done} of {loadProgress.total} parts.
+              Everything will fill in as it arrives.
+            </span>
+          </div>
+        )}
         <p className="sub">
           {sharedMeta?.at
             ? `Shared data last updated by ${sharedMeta.by || "someone"} on ${new Date(sharedMeta.at).toLocaleString("en-GB")}.`
