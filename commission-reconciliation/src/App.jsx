@@ -2468,38 +2468,17 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
 
-  // static vs live totals across the agents currently shown
-  const headline = useMemo(() => {
-    const allow = new Set(shownAgents.map(([n]) => n));
-    const mine = (r) => allow.has(r.partner || r.agent || "(unassigned)");
-    const liveRows = ns.filter((r) => idx.get(r.period) != null && mine(r));
-    const staticRows = keys.flatMap((mk) => (statics[mk] || []).filter(mine));
-    const live = summariseGp(liveRows, statusRules);
-    const stat = summariseGp(staticRows, statusRules);
-    return {
-      live, stat, months: keys.filter((mk) => statics[mk]).length,
-      diff: { total: live.total - stat.total, payable: live.payable - stat.payable, waiting: live.waiting - stat.waiting },
-    };
-  }, [ns, statics, shownAgents, keys.join(), statusRules, idx]);
-
-  // "Now payable" / "No longer payable" per month, across the agents shown
-  const monthlyMoves = useMemo(() => {
-    const blank = keys.map(() => ({ gained: 0, lost: 0, nGained: 0, nLost: 0, added: 0, removed: 0, nAdded: 0, nRemoved: 0 }));
-    if (!Object.keys(statics).length) return null;
-    const allow = new Set(shownAgents.map(([n]) => n));
-    for (const [bk, rows] of allChanges) {
-      const parts = bk.split("|");
-      const i = Number(parts.pop());
-      if (!allow.has(parts.join("|"))) continue;
-      for (const r of rows) {
-        if (r.becamePayable) { blank[i].gained += r.now || 0; blank[i].nGained++; }
-        if (r.lostPayable) { blank[i].lost += r.was || 0; blank[i].nLost++; }
-        if (r.change === "new") { blank[i].added += r.now || 0; blank[i].nAdded++; }
-        if (r.change === "removed") { blank[i].removed += r.was || 0; blank[i].nRemoved++; }
-      }
+  // payable totals per month: what payroll saw vs what the live report says now
+  const payableRows = useMemo(() => {
+    const stat = keys.map(() => 0), now = keys.map(() => 0);
+    for (const [name, g] of shownAgents) {
+      keys.forEach((_, i) => {
+        stat[i] += staticByAgent[name]?.[i]?.payable || 0;
+        now[i] += g.payable[i] || 0;
+      });
     }
-    return blank;
-  }, [shownAgents, statics, keys.join(), allChanges]);
+    return { stat, now, hasStatic: Object.keys(statics).length > 0 };
+  }, [shownAgents, staticByAgent, keys.join(), statics]);
 
   const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
 
@@ -2539,41 +2518,6 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
         status_config tone. Click a cell to see that month's orders on the right. Red background = below target. Targets come from the database where available, and can be
         overridden in Settings → Payplans. Tick a cell to mark the agent paid for that month.
       </p>
-
-      <div style={{ overflowX: "auto", marginBottom: 14 }}>
-        <table>
-          <thead><tr>
-            <th className="left">GP position</th>
-            <th className="num">Total</th><th className="num">Payable</th><th className="num">Waiting</th>
-          </tr></thead>
-          <tbody>
-            <tr>
-              <td className="left"><strong>Static report</strong>
-                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>
-                  {headline.months ? `${headline.months} month-end snapshot${headline.months === 1 ? "" : "s"}` : "none uploaded"}
-                </div>
-              </td>
-              <td className="num mono">{headline.months ? gbp0(headline.stat.total) : "-"}</td>
-              <td className="num mono">{headline.months ? gbp0(headline.stat.payable) : "-"}</td>
-              <td className="num mono">{headline.months ? gbp0(headline.stat.waiting) : "-"}</td>
-            </tr>
-            <tr>
-              <td className="left"><strong>Live report</strong></td>
-              <td className="num mono">{gbp0(headline.live.total)}</td>
-              <td className="num mono">{gbp0(headline.live.payable)}</td>
-              <td className="num mono">{gbp0(headline.live.waiting)}</td>
-            </tr>
-            <tr style={{ background: "#faf9ff" }}>
-              <td className="left"><strong>Difference</strong></td>
-              {["total", "payable", "waiting"].map((f) => (
-                <td key={f} className={"num mono " + (headline.months ? (headline.diff[f] >= 0 ? "pos" : "neg") : "")}>
-                  {headline.months ? `${headline.diff[f] > 0 ? "+" : ""}${gbp0(headline.diff[f])}` : "-"}
-                </td>
-              ))}
-            </tr>
-          </tbody>
-        </table>
-      </div>
 
       {breaches.length > 0 && (
         <div className="banner" style={{ marginBottom: 12 }}>
@@ -2659,6 +2603,38 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
                     </td>
                   ))}
                   <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.removed)))}</td>
+                </tr>
+                <tr className="moves">
+                  <td className="left agent">Payroll total payable</td>
+                  <td className="num">-</td>
+                  {payableRows.stat.map((v, i) => (
+                    <td key={i} className="num mono">{v ? gbp0(v) : "-"}</td>
+                  ))}
+                  <td className="num mono">{gbp0(sum(payableRows.stat))}</td>
+                </tr>
+                <tr className="moves">
+                  <td className="left agent">Current total payable</td>
+                  <td className="num">-</td>
+                  {payableRows.now.map((v, i) => (
+                    <td key={i} className="num mono">{v ? gbp0(v) : "-"}</td>
+                  ))}
+                  <td className="num mono">{gbp0(sum(payableRows.now))}</td>
+                </tr>
+                <tr className="moves">
+                  <td className="left agent"><strong>Difference</strong></td>
+                  <td className="num">-</td>
+                  {payableRows.now.map((v, i) => {
+                    const d = v - payableRows.stat[i];
+                    return (
+                      <td key={i} className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}>
+                        {payableRows.stat[i] || v ? `${d > 0 ? "+" : ""}${gbp0(d)}` : "-"}
+                      </td>
+                    );
+                  })}
+                  <td className={"num mono " + (sum(payableRows.now) - sum(payableRows.stat) >= 0 ? "pos" : "neg")}>
+                    {sum(payableRows.now) - sum(payableRows.stat) > 0 ? "+" : ""}
+                    {gbp0(sum(payableRows.now) - sum(payableRows.stat))}
+                  </td>
                 </tr>
               </>
             )}
