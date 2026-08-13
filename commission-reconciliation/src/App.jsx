@@ -1291,7 +1291,7 @@ export default function ReconciliationTool() {
         )}
 
         {/* controls: month + tolerance (only once there's data) */}
-        {anyLoaded && (
+        {anyLoaded && tab !== "agents" && tab !== "wip" && (
           <div className="panel">
             <div className="settings">
               <span>Month to check:</span>
@@ -1347,7 +1347,8 @@ export default function ReconciliationTool() {
             {tab === "cross" && <CrossReference records={result.records} settings={{ ...settings, risk: effectiveStatusRules }} />}
 
             {tab === "wip" && <WipTracker sources={sources} files={files} settings={{ ...settings, risk: effectiveStatusRules }} saveSettings={saveSettings}
-              settingsSaving={settingsSaving} supabase={supabase} session={session} />}
+              settingsSaving={settingsSaving} supabase={supabase} session={session}
+              period={period} setPeriod={setPeriod} periods={result.periods} />}
 
             {tab === "agents" && <AgentPayments sources={sources} files={files} settings={settings} saveSettings={saveSettings} staffNames={staffNames}
               dbPlans={staff.plans || {}} dbPlansByMonth={staff.plansByMonth || {}} dbPlanNames={staff.planNames || {}}
@@ -1881,7 +1882,8 @@ function useSourceLines(files, shared) {
 // =========================================================================
 //  WIP Tracker — replica of the monthly GP/WIP sheet
 // =========================================================================
-function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, session , sources }) {
+function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, session, sources,
+  period, setPeriod, periods = [] }) {
   const statusSettings = settings.risk || {};
   const { ns } = useSourceLines(files, sources);
 
@@ -2005,49 +2007,10 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
     return { nsIn, nsNoDate, nsOther };
   }, [ns, year]);
 
-  const wipByProduct = useMemo(() => {
-    const m = new Map();
-    for (const r of ns) {
-      if (fyStartOf(r.period) !== year) continue;
-      if (r.itemPaid != null ? isYes(r.itemPaid) : r.statusPaid) continue;
-      if (!statusCounts(statusSettings, r.status) || isNonCommissionable(r)) continue;
-      const g = r.productGroup2 || productGroupOf(r.product) || "Other";
-      m.set(g, (m.get(g) || 0) + (r.expected || 0));
-    }
-    return [...m.entries()].sort((a, b) => b[1] - a[1]);
-  }, [ns, year]);
-
   if (year == null) return <div className="empty panel">No dated rows found in the loaded files.</div>;
 
   return (
     <>
-      <div className="panel">
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
-          <h2 style={{ margin: 0 }}>Outstanding unpaid WIP — {fyLabel(year)}</h2>
-          <div className="settings">
-            <span>Financial year:</span>
-            <select value={year} onChange={(e) => setFy(Number(e.target.value))}
-              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
-              {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
-            </select>
-            {settingsSaving && <span className="sub" style={{ margin: 0 }}>Saving…</span>}
-          </div>
-        </div>
-        <div style={{ overflowX: "auto", marginTop: 12 }}>
-          <table>
-            <thead><tr>
-              {wipByProduct.map(([g]) => <th key={g} className="num">{g}</th>)}
-              <th className="num">Total outstanding</th>
-            </tr></thead>
-            <tbody><tr>
-              {wipByProduct.map(([g, v]) => <td key={g} className="num mono">{gbp(v)}</td>)}
-              <td className="num mono"><strong>{gbp(sum(wipByProduct.map((x) => x[1])))}</strong></td>
-            </tr></tbody>
-          </table>
-        </div>
-        <p className="note">Unpaid WIP = NetSuite GP where Item Paid is not "Yes", grouped by product. This page reads the NetSuite report only.</p>
-      </div>
-
       <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
       <div className="panel wip" style={{ flex: "1 1 auto", minWidth: 0 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
@@ -2057,6 +2020,13 @@ function WipTracker({ files, settings, saveSettings, settingsSaving, supabase, s
             <select value={year} onChange={(e) => setFy(Number(e.target.value))}
               style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
               {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+            </select>
+            <span style={{ width: 10 }} />
+            <span>Month to check:</span>
+            <select value={period} onChange={(e) => setPeriod(e.target.value)}
+              style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+              <option value="all">All months</option>
+              {periods.map((pp) => <option key={pp} value={pp}>{periodLabel(pp)}</option>)}
             </select>
           </div>
         </div>
@@ -2640,6 +2610,50 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
           {breaches.length > 40 && <p className="note">Showing 40 of {breaches.length}.</p>}
         </div>
       )}
+      {monthlyMoves && (() => {
+        const pickf = (f) => (mIdx == null ? sum(monthlyMoves.map((m) => m[f])) : monthlyMoves[mIdx][f]);
+        const items = [
+          ["Now payable", "gained", "nGained", "#14804a"],
+          ["No longer payable", "lost", "nLost", "#b3261e"],
+          ["Added since PR", "added", "nAdded", "#14804a"],
+          ["Removed since PR", "removed", "nRemoved", "#b3261e"],
+        ];
+        return (
+          <div className="fcards" style={{ marginTop: 4 }}>
+            {items.map(([label, f, nf, colour]) => (
+              <div key={label} className="fcard" style={{ borderTopColor: colour, cursor: "default" }}>
+                <span className="n" style={{ color: colour, fontSize: 15 }}>{gbp0(pickf(f))}</span>
+                <span className="l">{label}{pickf(nf) ? ` · ${pickf(nf)} orders` : ""}</span>
+              </div>
+            ))}
+            <div className="fcard" style={{ borderTopColor: "#5514b4", cursor: "default" }}>
+              <span className="n" style={{ color: "#5514b4", fontSize: 15 }}>
+                {gbp0(mIdx == null ? sum(payableRows.stat) : payableRows.stat[mIdx])}
+              </span>
+              <span className="l">Payroll total payable</span>
+            </div>
+            <div className="fcard" style={{ borderTopColor: "#5514b4", cursor: "default" }}>
+              <span className="n" style={{ color: "#5514b4", fontSize: 15 }}>
+                {gbp0(mIdx == null ? sum(payableRows.now) : payableRows.now[mIdx])}
+              </span>
+              <span className="l">Current total payable</span>
+            </div>
+            {(() => {
+              const d = mIdx == null ? sum(payableRows.now) - sum(payableRows.stat)
+                : payableRows.now[mIdx] - payableRows.stat[mIdx];
+              return (
+                <div className="fcard" style={{ borderTopColor: d >= 0 ? "#14804a" : "#b3261e", cursor: "default" }}>
+                  <span className="n" style={{ color: d >= 0 ? "#14804a" : "#b3261e", fontSize: 15 }}>
+                    {d > 0 ? "+" : ""}{gbp0(d)}
+                  </span>
+                  <span className="l">Difference</span>
+                </div>
+              );
+            })()}
+          </div>
+        );
+      })()}
+
       <div style={{ overflowX: "auto" }} className="pay">
         <table>
           <thead>
@@ -2656,54 +2670,30 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             </tr>
           </thead>
           <tbody>
-            {monthlyMoves && (() => {
-              const tot = (f) => (mIdx == null ? sum(monthlyMoves.map((m) => m[f])) : monthlyMoves[mIdx][f]);
-              const cnt = (f) => (mIdx == null ? sum(monthlyMoves.map((m) => m[f])) : monthlyMoves[mIdx][f]);
-              const line = (label, f, nf, colour) => (
-                <tr className="moves">
-                  <td className="left agent">{label}</td>
-                  <td className="num">-</td>
-                  <td className="num mono" colSpan={7} style={{ textAlign: "left", color: colour }}>
-                    {tot(f) ? gbp0(tot(f)) : "-"}
-                    {cnt(nf) > 0 && <span className="sub" style={{ marginLeft: 8 }}>{cnt(nf)} order{cnt(nf) === 1 ? "" : "s"}</span>}
-                  </td>
-                </tr>
-              );
+            {(() => {
+              // Totals across the agents currently shown, for the selected month/year
+              const t = { plan: 0, payrollGp: 0, now: 0, payable: 0, waiting: 0, paid: 0 };
+              for (const [name, g] of shownAgents) {
+                const v = agentRow(name, g);
+                t.payrollGp += v.payrollGp; t.now += v.now; t.payable += v.payable;
+                t.waiting += v.waiting; t.paid += v.paid;
+                t.plan += mIdx == null ? sum(keys.map((_, j) => planFor(name, j))) : planFor(name, mIdx);
+              }
+              const d = t.now - t.payrollGp;
               return (
-                <>
-                  {line("Now payable", "gained", "nGained", "#14804a")}
-                  {line("No longer payable", "lost", "nLost", "#b3261e")}
-                  {line("Added since PR", "added", "nAdded", "#14804a")}
-                  {line("Removed since PR", "removed", "nRemoved", "#b3261e")}
-                  <tr className="moves">
-                    <td className="left agent">Payroll total payable</td>
-                    <td className="num">-</td>
-                    <td className="num mono" colSpan={7} style={{ textAlign: "left" }}>
-                      {gbp0(mIdx == null ? sum(payableRows.stat) : payableRows.stat[mIdx])}
-                    </td>
-                  </tr>
-                  <tr className="moves">
-                    <td className="left agent">Current total payable</td>
-                    <td className="num">-</td>
-                    <td className="num mono" colSpan={7} style={{ textAlign: "left" }}>
-                      {gbp0(mIdx == null ? sum(payableRows.now) : payableRows.now[mIdx])}
-                    </td>
-                  </tr>
-                  <tr className="moves">
-                    <td className="left agent"><strong>Difference</strong></td>
-                    <td className="num">-</td>
-                    {(() => {
-                      const d = (mIdx == null ? sum(payableRows.now) - sum(payableRows.stat)
-                        : payableRows.now[mIdx] - payableRows.stat[mIdx]);
-                      return (
-                        <td className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}
-                          colSpan={7} style={{ textAlign: "left" }}>
-                          {d > 0 ? "+" : ""}{gbp0(d)}
-                        </td>
-                      );
-                    })()}
-                  </tr>
-                </>
+                <tr className="moves">
+                  <td className="left agent"><strong>Total ({shownAgents.length} agents)</strong></td>
+                  <td className="num mono">{t.plan ? gbp0(t.plan) : "-"}</td>
+                  <td className="num mono">{t.payrollGp ? gbp0(t.payrollGp) : "-"}</td>
+                  <td className="num mono"><strong>{t.now ? gbp0(t.now) : "-"}</strong></td>
+                  <td className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}>
+                    {t.payrollGp || t.now ? `${d > 0 ? "+" : ""}${gbp0(d)}` : "-"}
+                  </td>
+                  <td className="num mono" style={{ color: "#14804a" }}>{t.payable ? gbp0(t.payable) : "-"}</td>
+                  <td className="num mono" style={{ color: "#8a5a00" }}>{t.waiting ? gbp0(t.waiting) : "-"}</td>
+                  <td className="num mono">{t.paid ? gbp0(t.paid) : "-"}</td>
+                  <td className="num">-</td>
+                </tr>
               );
             })()}
             {shownAgents.map(([name, g]) => {
@@ -2989,8 +2979,38 @@ function Settings(props) {
     ...(isAdmin ? [["users", "Users"]] : []),
   ];
 
-  // every order status seen in the loaded data
+  // every order status seen in the loaded data, plus everything status_config knows about
   const { nameCol: scName, toneCol: scTone } = statusConfig.cols || {};
+  const allStatuses = useMemo(() => {
+    const m = new Map();
+    const get = (name) => {
+      if (!m.has(name)) m.set(name, { name, nsCount: 0, gp: 0, tone: null });
+      return m.get(name);
+    };
+    if (scName && scTone) {
+      for (const r of statusConfig.rows) {
+        const nm = String(r[scName] || "").trim();
+        if (nm) get(nm).tone = r[scTone];
+      }
+    }
+    records.forEach((r) => {
+      const st = String(r.nsStatus || "").trim();
+      const e = get(st);
+      e.nsCount++;
+      e.gp += r.expected || 0;
+    });
+    return [...m.values()].sort((a, b) => b.nsCount - a.nsCount);
+  }, [records, statusConfig, scName, scTone]);
+
+  const agentNames = useMemo(() => {
+    const set = new Set(staffNames);
+    records.forEach((r) => { if (r.agent) set.add(r.agent); });
+    return [...set].sort((a, b) => {
+      const ma = managers[a] || "zzz", mb = managers[b] || "zzz";
+      return ma.localeCompare(mb) || a.localeCompare(b);
+    });
+  }, [records, staffNames.join(), managers]);
+
   const payplans = settings.payplans || {};
   const dbPlans = staff.plans || {};
   const cfg = settings.payplanSource || {};
