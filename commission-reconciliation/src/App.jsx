@@ -625,6 +625,8 @@ const STYLES = `
 .kpic .val { font-size:21px; font-weight:800; margin-top:3px; letter-spacing:-.02em; }
 .kpic .sub2 { font-size:12px; font-weight:700; margin-top:1px; }
 .two { display:grid; grid-template-columns:1.55fr 1fr; gap:14px; align-items:start; }
+.two34 { display:grid; grid-template-columns:3fr 1fr; gap:14px; align-items:start; }
+@media (max-width:1100px){ .two34 { grid-template-columns:1fr; } }
 @media (max-width:1100px){ .two { grid-template-columns:1fr; } }
 .legend { display:flex; gap:14px; font-size:12px; color:#5b5676; margin-bottom:6px; flex-wrap:wrap; }
 .legend i { width:10px; height:10px; border-radius:3px; display:inline-block; margin-right:5px; }
@@ -1085,18 +1087,19 @@ export default function ReconciliationTool() {
   }, [saveShared]);
 
   // status_config (tone column) is the base; anything set by hand in Settings overrides it
+  // driven entirely by the status_config "tone" column
   const effectiveStatusRules = useMemo(() => {
     const out = {};
     const { nameCol, toneCol } = statusConfig.cols || {};
     if (nameCol && toneCol) {
       for (const r of statusConfig.rows) {
         const nm = String(r[nameCol] || "").trim();
-        const t = toneToTreatment(r[toneCol]);
+        const t = toneCategory(r[toneCol]);
         if (nm && t) out[nm] = t;
       }
     }
-    return { ...out, ...(settings.risk || {}) };
-  }, [statusConfig, settings.risk]);
+    return out;
+  }, [statusConfig]);
 
   const result = useMemo(() => reconcile(files, TOLERANCE, period, effectiveStatusRules),
     [files, period, effectiveStatusRules]);
@@ -2336,7 +2339,6 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
   managers = {}, statusRules = {}, supabase, session , sources }) {
   const monthlyPlans = settings.payplanMonthly || {};
   const { ns, cb } = useSourceLines(files, sources);
-  const [basis, setBasis] = useState("earned");
 
   const years = useMemo(() => {
     const s = new Set();
@@ -2471,6 +2473,7 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
 
   const [drill, setDrill] = useState(null);   // { agent, i }
   const [drillFilter, setDrillFilter] = useState("all");   // all | added | removed | value | gained | lost
+  const [monthSel, setMonthSel] = useState("all");         // "all" or a month index
 
   // manager filter
   const [mgr, setMgr] = useState("all");
@@ -2555,6 +2558,23 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
     return { stat, now, hasStatic: Object.keys(statics).length > 0 };
   }, [shownAgents, staticByAgent, keys.join(), statics]);
 
+  // figures for the selected month, or summed across the year
+  const mIdx = monthSel === "all" ? null : Number(monthSel);
+  const pick1 = (arr) => (mIdx == null ? sum(arr) : (arr[mIdx] || 0));
+  const agentRow = useCallback((name, g) => {
+    const payrollGp = mIdx == null
+      ? sum(keys.map((_, i) => staticByAgent[name]?.[i]?.total || 0))
+      : (staticByAgent[name]?.[mIdx]?.total || 0);
+    const payrollPayable = mIdx == null
+      ? sum(keys.map((_, i) => staticByAgent[name]?.[i]?.payable || 0))
+      : (staticByAgent[name]?.[mIdx]?.payable || 0);
+    return {
+      payrollGp, payrollPayable,
+      now: pick1(g.earned), payable: pick1(g.payable), waiting: pick1(g.claimedIssued),
+      paid: pick1(g.paid),
+    };
+  }, [mIdx, keys.join(), staticByAgent]);
+
   const drillRows = drill ? changesFor(drill.agent, drill.i) : null;
 
   return (
@@ -2564,9 +2584,16 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
         <h2 style={{ margin: 0 }}>Payroll — {fyLabel(year)}</h2>
         <div className="settings">
           <span>Financial year:</span>
-          <select value={year} onChange={(e) => setFy(Number(e.target.value))}
+          <select value={year} onChange={(e) => { setFy(Number(e.target.value)); setDrill(null); }}
             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
             {years.map((y) => <option key={y} value={y}>{fyLabel(y)}</option>)}
+          </select>
+          <span style={{ width: 12 }} />
+          <span>Month:</span>
+          <select value={monthSel} onChange={(e) => { setMonthSel(e.target.value); setDrill(null); }}
+            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
+            <option value="all">Whole year</option>
+            {MONTHS_FY.map(([, l], i) => <option key={l} value={i}>{l}</option>)}
           </select>
           <span style={{ width: 12 }} />
           <span>Manager:</span>
@@ -2574,15 +2601,6 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
             <option value="all">All managers</option>
             {managerList.map((mm) => <option key={mm} value={mm}>{mm}</option>)}
-          </select>
-          <span style={{ width: 12 }} />
-          <span>Show:</span>
-          <select value={basis} onChange={(e) => setBasis(e.target.value)}
-            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13 }}>
-            <option value="earned">Total GP</option>
-            <option value="payable">Payable GP only</option>
-            <option value="claimedIssued">Waiting only</option>
-            <option value="paid">Paid on Cobra</option>
           </select>
         </div>
       </div>
@@ -2628,141 +2646,107 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
             <tr>
               <th className="left agent">Agent</th>
               <th className="num">Payplan</th>
-              {MONTHS_FY.map(([, l]) => <th key={l} className="num">{l}</th>)}
-              <th className="num">Total</th>
+              <th className="num">Payroll GP</th>
+              <th className="num">Now GP</th>
+              <th className="num">Difference</th>
+              <th className="num">Payable</th>
+              <th className="num">Waiting</th>
+              <th className="num">Paid on Cobra</th>
+              <th className="num">Paid?</th>
             </tr>
           </thead>
           <tbody>
-            {monthlyMoves && (
-              <>
+            {monthlyMoves && (() => {
+              const tot = (f) => (mIdx == null ? sum(monthlyMoves.map((m) => m[f])) : monthlyMoves[mIdx][f]);
+              const cnt = (f) => (mIdx == null ? sum(monthlyMoves.map((m) => m[f])) : monthlyMoves[mIdx][f]);
+              const line = (label, f, nf, colour) => (
                 <tr className="moves">
-                  <td className="left agent">Now payable</td>
+                  <td className="left agent">{label}</td>
                   <td className="num">-</td>
-                  {monthlyMoves.map((m, i) => (
-                    <td key={i} className="num mono" style={{ color: m.gained ? "#14804a" : undefined }}>
-                      {m.gained ? gbp0(m.gained) : "-"}
-                      {m.nGained > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nGained} order{m.nGained === 1 ? "" : "s"}</div>}
-                    </td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.gained)))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent">No longer payable</td>
-                  <td className="num">-</td>
-                  {monthlyMoves.map((m, i) => (
-                    <td key={i} className="num mono" style={{ color: m.lost ? "#b3261e" : undefined }}>
-                      {m.lost ? gbp0(m.lost) : "-"}
-                      {m.nLost > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nLost} order{m.nLost === 1 ? "" : "s"}</div>}
-                    </td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.lost)))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent">Added since PR</td>
-                  <td className="num">-</td>
-                  {monthlyMoves.map((m, i) => (
-                    <td key={i} className="num mono" style={{ color: m.added ? "#14804a" : undefined }}>
-                      {m.added ? gbp0(m.added) : "-"}
-                      {m.nAdded > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nAdded} order{m.nAdded === 1 ? "" : "s"}</div>}
-                    </td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.added)))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent">Removed since PR</td>
-                  <td className="num">-</td>
-                  {monthlyMoves.map((m, i) => (
-                    <td key={i} className="num mono" style={{ color: m.removed ? "#b3261e" : undefined }}>
-                      {m.removed ? gbp0(m.removed) : "-"}
-                      {m.nRemoved > 0 && <div style={{ fontSize: 9.5, fontWeight: 400 }}>{m.nRemoved} order{m.nRemoved === 1 ? "" : "s"}</div>}
-                    </td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(monthlyMoves.map((m) => m.removed)))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent">Payroll total payable</td>
-                  <td className="num">-</td>
-                  {payableRows.stat.map((v, i) => (
-                    <td key={i} className="num mono">{v ? gbp0(v) : "-"}</td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(payableRows.stat))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent">Current total payable</td>
-                  <td className="num">-</td>
-                  {payableRows.now.map((v, i) => (
-                    <td key={i} className="num mono">{v ? gbp0(v) : "-"}</td>
-                  ))}
-                  <td className="num mono">{gbp0(sum(payableRows.now))}</td>
-                </tr>
-                <tr className="moves">
-                  <td className="left agent"><strong>Difference</strong></td>
-                  <td className="num">-</td>
-                  {payableRows.now.map((v, i) => {
-                    const d = v - payableRows.stat[i];
-                    return (
-                      <td key={i} className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}>
-                        {payableRows.stat[i] || v ? `${d > 0 ? "+" : ""}${gbp0(d)}` : "-"}
-                      </td>
-                    );
-                  })}
-                  <td className={"num mono " + (sum(payableRows.now) - sum(payableRows.stat) >= 0 ? "pos" : "neg")}>
-                    {sum(payableRows.now) - sum(payableRows.stat) > 0 ? "+" : ""}
-                    {gbp0(sum(payableRows.now) - sum(payableRows.stat))}
+                  <td className="num mono" colSpan={7} style={{ textAlign: "left", color: colour }}>
+                    {tot(f) ? gbp0(tot(f)) : "-"}
+                    {cnt(nf) > 0 && <span className="sub" style={{ marginLeft: 8 }}>{cnt(nf)} order{cnt(nf) === 1 ? "" : "s"}</span>}
                   </td>
                 </tr>
-              </>
-            )}
-            {shownAgents.map(([name, g]) => {
-              const vals = g[basis] || g.earned;
+              );
               return (
-                <tr key={name}>
+                <>
+                  {line("Now payable", "gained", "nGained", "#14804a")}
+                  {line("No longer payable", "lost", "nLost", "#b3261e")}
+                  {line("Added since PR", "added", "nAdded", "#14804a")}
+                  {line("Removed since PR", "removed", "nRemoved", "#b3261e")}
+                  <tr className="moves">
+                    <td className="left agent">Payroll total payable</td>
+                    <td className="num">-</td>
+                    <td className="num mono" colSpan={7} style={{ textAlign: "left" }}>
+                      {gbp0(mIdx == null ? sum(payableRows.stat) : payableRows.stat[mIdx])}
+                    </td>
+                  </tr>
+                  <tr className="moves">
+                    <td className="left agent">Current total payable</td>
+                    <td className="num">-</td>
+                    <td className="num mono" colSpan={7} style={{ textAlign: "left" }}>
+                      {gbp0(mIdx == null ? sum(payableRows.now) : payableRows.now[mIdx])}
+                    </td>
+                  </tr>
+                  <tr className="moves">
+                    <td className="left agent"><strong>Difference</strong></td>
+                    <td className="num">-</td>
+                    {(() => {
+                      const d = (mIdx == null ? sum(payableRows.now) - sum(payableRows.stat)
+                        : payableRows.now[mIdx] - payableRows.stat[mIdx]);
+                      return (
+                        <td className={"num mono " + (d === 0 ? "" : d > 0 ? "pos" : "neg")}
+                          colSpan={7} style={{ textAlign: "left" }}>
+                          {d > 0 ? "+" : ""}{gbp0(d)}
+                        </td>
+                      );
+                    })()}
+                  </tr>
+                </>
+              );
+            })()}
+            {shownAgents.map(([name, g]) => {
+              const v = agentRow(name, g);
+              const i = mIdx == null ? 0 : mIdx;
+              const plan = mIdx == null ? sum(keys.map((_, j) => planFor(name, j))) : planFor(name, i);
+              const bad = plan > 0 && v.payable < plan;
+              const marked = mIdx != null && isMarkedPaid(name, i);
+              const diff = v.now - v.payrollGp;
+              const open = drill && drill.agent === name;
+              return (
+                <tr key={name} style={{ background: bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
+                  boxShadow: open ? "inset 0 0 0 2px #5514b4" : undefined, cursor: mIdx == null ? "default" : "pointer" }}
+                  onClick={() => mIdx != null && setDrill(open && drill.i === i ? null : { agent: name, i })}>
                   <td className="left agent">
                     {name}
                     {managers[name] && <div className="sub" style={{ margin: 0, fontSize: 10 }}>{managers[name]}</div>}
                   </td>
-                  <td className="num mono">{payplans[name] ?? dbPlans[name] ? gbp(Number(payplans[name] ?? dbPlans[name])) : "-"}</td>
-                  {vals.map((v, i) => {
-                    const bad = below(name, g.payable[i] || 0, i);
-                    const plan = planFor(name, i);
-                    const marked = isMarkedPaid(name, i);
-                    return (
-                      <td key={i} className="num mono"
-                        onClick={() => setDrill(drill && drill.agent === name && drill.i === i ? null : { agent: name, i })}
-                        title="Click to see the orders behind this month"
-                        style={{ cursor: "pointer",
-                          boxShadow: drill && drill.agent === name && drill.i === i ? "inset 0 0 0 2px #5514b4" : undefined,
-                          background: bad && (marked || (g.paid[i] || 0) > 0) ? "#f9d9d5"
-                            : bad ? "#fbe9e7" : marked ? "#e6f4ec" : undefined,
-                          color: bad ? "#b3261e" : undefined,
-                          outline: bad && (marked || (g.paid[i] || 0) > 0) ? "2px solid #b3261e" : undefined }}>
-                        {basis === "earned" ? (
-                          <>
-                            {staticByAgent[name] && (
-                              <div style={{ fontSize: 10.5, color: "#5b5676" }}>
-                                Payroll: {gbp0(staticByAgent[name][i].total)}
-                              </div>
-                            )}
-                            <div><strong>Now: {v ? gbp0(v) : "-"}</strong></div>
-                            <div style={{ fontSize: 10, color: "#14804a" }}>payable {gbp0(g.payable[i] || 0)}</div>
-                            <div style={{ fontSize: 10, color: "#8a5a00" }}>waiting {gbp0(g.claimedIssued[i] || 0)}</div>
-                          </>
-                        ) : <div>{v ? gbp0(v) : "-"}</div>}
-                        {plan > 0 && <div style={{ fontSize: 10, color: bad ? "#b3261e" : "#8a8aa3" }}>plan {gbp0(plan)}</div>}
-                        <label style={{ fontSize: 10, color: "#8a8aa3", cursor: "pointer", display: "inline-flex", gap: 3, alignItems: "center" }}>
-                          <input type="checkbox" checked={marked} onChange={() => togglePaid(name, i)} style={{ margin: 0 }} />
-                          paid
-                        </label>
-                      </td>
-                    );
-                  })}
-                  <td className="num mono"><strong>{gbp0(sum(vals))}</strong></td>
+                  <td className="num mono">{plan > 0 ? gbp0(plan) : "-"}</td>
+                  <td className="num mono">{v.payrollGp ? gbp0(v.payrollGp) : "-"}</td>
+                  <td className="num mono"><strong>{v.now ? gbp0(v.now) : "-"}</strong></td>
+                  <td className={"num mono " + (diff === 0 ? "" : diff > 0 ? "pos" : "neg")}>
+                    {v.payrollGp || v.now ? `${diff > 0 ? "+" : ""}${gbp0(diff)}` : "-"}
+                  </td>
+                  <td className="num mono" style={{ color: bad ? "#b3261e" : "#14804a" }}>
+                    {v.payable ? gbp0(v.payable) : "-"}
+                  </td>
+                  <td className="num mono" style={{ color: "#8a5a00" }}>{v.waiting ? gbp0(v.waiting) : "-"}</td>
+                  <td className="num mono">{v.paid ? gbp0(v.paid) : "-"}</td>
+                  <td className="num">
+                    {mIdx == null ? <span className="sub">-</span> : (
+                      <input type="checkbox" checked={marked}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={() => togglePaid(name, i)} />
+                    )}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+
       {shownAgents.length === 0 && <div className="empty">No agents match this filter.</div>}
     </div>
 
@@ -3007,50 +2991,6 @@ function Settings(props) {
 
   // every order status seen in the loaded data
   const { nameCol: scName, toneCol: scTone } = statusConfig.cols || {};
-  // offer the tone words this business actually uses, falling back to the four categories
-  const toneOptions = useMemo(() => {
-    const seen = new Map();
-    if (scTone) for (const r of statusConfig.rows) {
-      const t = String(r[scTone] || "").trim();
-      const cat = toneCategory(t);
-      if (t && cat && !seen.has(cat)) seen.set(cat, t);
-    }
-    for (const c of ["payable", "claimed", "issued", "red"]) if (!seen.has(c)) seen.set(c, c);
-    return [...seen.entries()];   // [category, label]
-  }, [statusConfig, scTone]);
-  const allStatuses = useMemo(() => {
-    const m = new Map();
-    const get = (name) => {
-      if (!m.has(name)) m.set(name, { name, nsCount: 0, webosCount: 0, gp: 0, tone: null });
-      return m.get(name);
-    };
-    if (scName && scTone) {
-      for (const r of statusConfig.rows) {
-        const nm = String(r[scName] || "").trim();
-        if (nm) get(nm).tone = r[scTone];
-      }
-    }
-    records.forEach((r) => {
-      const st = String(r.nsStatus || "").trim();
-      const e = get(st);
-      e.nsCount++;
-      e.gp += r.expected || 0;
-    });
-    (webosStatuses.list || []).forEach((w) => { get(w.name).webosCount = w.n; });
-    return [...m.values()].sort((a, b) => (b.nsCount + b.webosCount) - (a.nsCount + a.webosCount));
-  }, [records, webosStatuses, statusConfig]);
-
-  const agentNames = useMemo(() => {
-    const s = new Set(staffNames);
-    records.forEach((r) => { if (r.agent) s.add(r.agent); });
-    return [...s].sort((a, b) => {
-      const ma = managers[a] || "zzz", mb = managers[b] || "zzz";
-      return ma.localeCompare(mb) || a.localeCompare(b);
-    });
-  }, [records, staffNames.join(), managers]);
-
-  const risk = settings.risk || {};
-  const suggestedRisk = (st) => (isExcludedStatus(st) ? "high" : "");
   const payplans = settings.payplans || {};
   const dbPlans = staff.plans || {};
   const cfg = settings.payplanSource || {};
@@ -3070,22 +3010,14 @@ function Settings(props) {
         <div className="panel">
           <h2>Order statuses</h2>
           <p className="note" style={{ marginTop: 0 }}>
-            <strong>Risk %</strong> is how likely that GP is to fall away — it drives the Top Risk Orders tab.
+            <strong>Comm. status</strong> comes from the <span className="mono">status_config</span> table's tone column and
+            decides how each order's GP is treated everywhere in this app — anything marked <em>red</em> is not counted at all.
+            <strong> Risk %</strong> is how likely that GP is to fall away; it drives the Top Risk Orders tab.
             Leave it blank to use the default for the category.
-            Statuses marked <span className="chip risk">Red GP</span> are <strong>not counted</strong> towards GP or SOV —
-            the same rule SchThrive WebOS uses. This drives the Cobra Dashboard and the Net figures on Cross-Reference.
             {statusConfig.status === "ok"
-              ? ` Treatment comes from the status_config table's "${scTone}" column; change one here to override it.`
-              : statusConfig.status === "error" ? " (Couldn't read status_config — using the built-in rules.)" : ""}
+              ? ` Reading the "${scTone}" column from status_config.`
+              : statusConfig.status === "error" ? " (Couldn't read status_config — falling back to the built-in rules.)" : ""}
           </p>
-          <div style={{ marginBottom: 12 }}>
-            <button className="btn" onClick={() => {
-              saveSettings({ ...settings, risk: {} });
-            }}>Reset to status_config</button>
-            <span className="sub" style={{ marginLeft: 10 }}>
-              Clears any manual overrides so every status follows the database tone again.
-            </span>
-          </div>
           {allStatuses.length === 0 ? (
             <div className="empty">No order statuses found yet — load the NetSuite export first.</div>
           ) : (
@@ -3094,21 +3026,20 @@ function Settings(props) {
                 <thead><tr>
                   <th className="left">Order status</th>
                   <th className="num">In NetSuite</th>
-                  <th className="num">In SchThrive</th>
-                  <th className="num">Tone</th>
+                  <th className="num">Comm. status</th>
                   <th className="num">GP in NetSuite</th>
                   <th className="num">Risk %</th>
-                  <th className="num">Payable?</th>
                 </tr></thead>
                 <tbody>
                   {allStatuses.map((st) => {
-                    const setting = risk[st.name] || toneToTreatment(st.tone) || (isExcludedStatus(st.name) ? "red" : "counts");
+                    const setting = toneCategory(st.tone) || (isExcludedStatus(st.name) ? "red" : "payable");
                     return (
                       <tr key={st.name || "(blank)"} style={{ background: setting === "red" ? "#fdf3f2" : undefined }}>
                         <td className="left">{st.name || <em className="sub">(blank)</em>}</td>
                         <td className="num mono">{st.nsCount || "-"}</td>
-                        <td className="num mono">{st.webosCount || "-"}</td>
-                        <td className="num">{st.tone ? <span className="chip" style={CAT_STYLE[toneCategory(st.tone)] || {}}>{String(st.tone)}</span> : "-"}</td>
+                        <td className="num">{st.tone
+                          ? <span className="chip" style={CAT_STYLE[toneCategory(st.tone)] || {}}>{String(st.tone)}</span>
+                          : <span className="sub">not in status_config</span>}</td>
                         <td className="num mono">{st.gp ? gbp(st.gp) : "-"}</td>
                         <td className="num">
                           <NumInput
@@ -3118,18 +3049,6 @@ function Settings(props) {
                               riskPct: { ...(settings.riskPct || {}), [st.name]: nv === "" ? "" : Number(nv) } })}
                             style={{ width: 62, padding: "4px 6px", border: "1px solid #d3d0e6",
                               borderRadius: 6, fontSize: 12, textAlign: "center" }} />
-                        </td>
-                        <td className="num">
-                          <select value={setting}
-                            onChange={(e) => saveSettings({ ...settings, risk: { ...risk, [st.name]: e.target.value } })}
-                            style={{ padding: "5px 8px", border: "1px solid #d3d0e6", borderRadius: 6, fontSize: 13,
-                              color: setting === "red" ? "#b3261e" : "#14804a", fontWeight: 600 }}>
-                            {toneOptions.map(([cat, label]) => (
-                              <option key={cat} value={cat}>
-                                {label}{cat === "red" ? " (ignored)" : ""}
-                              </option>
-                            ))}
-                          </select>
                         </td>
                       </tr>
                     );
@@ -3603,230 +3522,230 @@ function Overview({ records, files, settings, snapshot, saveSnapshot, setTab, su
         </div>
       </div>
 
-      <div className="two" style={{ marginTop: 14 }}>
-        <div className="panel">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-            <h2 style={{ margin: 0 }}>
-              Monthly {mode === "gp" ? "GP" : "SOV"} position{cYear != null ? ` — ${fyLabel(cYear)}` : ""}
-            </h2>
-            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
-              {[["gp", "GP"], ["sov", "SOV"]].map(([v, l]) => (
-                <button key={v} className={"tab " + (mode === v ? "active" : "")}
-                  style={{ padding: "5px 14px", fontSize: 12.5 }} onClick={() => setMode(v)}>{l}</button>
-              ))}
-            </div>
-          </div>
-          <div className="legend" style={{ marginTop: 10 }}>
-            {SERIES.map(([kk, c, l]) => <span key={kk}><i style={{ background: c }} />{l}</span>)}
-          </div>
-          {monthly.length === 0 ? <div className="empty">No dated rows yet.</div> : (
-            <div style={{ overflowX: "auto" }}>
-              <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 520, height: 240 }}>
-                {[0, 0.25, 0.5, 0.75, 1].map((f) => (
-                  <g key={f}>
-                    <line x1={padL} x2={W - 4} y1={y(niceMax * f)} y2={y(niceMax * f)} stroke="#eceaf4" />
-                    <text x={padL - 6} y={y(niceMax * f) + 3} textAnchor="end" fontSize="9" fill="#8a8aa3">
-                      {Math.round((niceMax * f) / 1000)}K
-                    </text>
-                  </g>
-                ))}
-                {monthly.map((d, i) => (
-                  <g key={d.p}>
-                    {SERIES.map(([kk, c], j) => {
-                      const n = SERIES.length, slot = (bw - 8) / n;
-                      const h = Math.max(0, y(0) - y(d[kk]));
-                      return <rect key={kk} x={padL + i * bw + 4 + j * slot} y={y(d[kk])}
-                        width={Math.max(2, slot - 2)} height={h} fill={c} rx="1.5" />;
-                    })}
-                    <text x={padL + i * bw + bw / 2} y={H - 8} textAnchor="middle" fontSize="9" fill="#8a8aa3">
-                      {MONTHS_FY[i][1]}
-                    </text>
-                  </g>
-                ))}
-              </svg>
-            </div>
-          )}
-          {mode === "sov" && (
-            <p className="note">
-              Sch5 SOV counts only rows flagged Y in{" "}
-              <span className="mono">{flagCol || "(no flag column found)"}</span>
-              {flagCol && flagCol !== "SCH5 ORDER" ? " — no \"Sch5 Order\" column in this export, so this is the closest match." : ""}
-            </p>
-          )}
-        </div>
-
-        <div className="panel">
-          <h2>NetSuite vs Cobra</h2>
-          <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-            <Donut matched={k.pctMatched} review={0} exception={k.pctException} />
-            <div style={{ fontSize: 13 }}>
-              {[["Matched", k.pctMatched, "#14804a", k.nMatched],
-                ["Mismatch", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
-                <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                  <i style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
-                  <span style={{ minWidth: 78 }}>{l}</span>
-                  <strong className="mono">{v.toFixed(1)}%</strong>
-                  <span className="sub" style={{ margin: 0 }}>({n})</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="two" style={{ marginTop: 14 }}>
-        <div className="panel">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
-            <h2 style={{ margin: 0 }}>Flagged orders from payroll updates <span className="sub">({flagged.length})</span></h2>
-            {flagged.length > 0 && (
-              <button className="btn" onClick={() => downloadCSV(flagged.map((r) => ({
-                Month: periodLabel(r.mk), "Order ref": r.orderNum || "", "NetSuite ref": r.netsuiteRef || "",
-                Company: r.company || "", Partner: r.partner || "", Item: r.product || "",
-                "Status was": r.wasStatus || "", "Status now": r.status || "",
-                "Category was": r.wasCat || "", "Category now": r.cat || "",
-                "GP was": r.was ?? "", "GP now": r.now ?? "", Reason: r.reason,
-              })), "flagged-orders.csv")}>Export</button>
-            )}
-          </div>
-          {flagged.length > 0 && <ChangeFilters rows={flagged} value={flagFilter} onChange={setFlagFilter} />}
-          {flagged.length > 0 && (() => {
-            const t = { was: 0, now: 0 };
-            for (const r of shownFlagged) { t.was += r.was || 0; t.now += r.now || 0; }
-            const counts = shownFlagged.reduce((m, r) => { m[r.reason] = (m[r.reason] || 0) + 1; return m; }, {});
-            return (
-              <div style={{ overflowX: "auto", marginTop: 10, marginBottom: 4 }}>
-                <table>
-                  <thead><tr>
-                    <th className="left">Flagged total</th>
-                    <th className="num">GP at payroll</th><th className="num">GP now</th><th className="num">Difference</th>
-                  </tr></thead>
-                  <tbody>
-                    <tr>
-                      <td className="left">{shownFlagged.length} order{shownFlagged.length === 1 ? "" : "s"}</td>
-                      <td className="num mono">{gbp0(t.was)}</td>
-                      <td className="num mono">{gbp0(t.now)}</td>
-                      <td className={"num mono " + (t.now - t.was >= 0 ? "pos" : "neg")}>
-                        {t.now - t.was > 0 ? "+" : ""}{gbp0(t.now - t.was)}
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-                <p className="note" style={{ marginTop: 6 }}>
-                  {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}: ${n}`).join(" · ")}
-                </p>
-              </div>
-            );
-          })()}
-          {flagged.length === 0 ? (
-            <div className="empty">
-              {Object.keys(statics).length === 0
-                ? <>No month-end snapshots uploaded for this year yet — add them under <strong>Settings → Monthly Reports</strong> to see what has moved since payroll.</>
-                : "Nothing has changed since the payroll snapshots."}
-            </div>
-          ) : (
-            <div style={{ overflowX: "auto", marginTop: 10, maxHeight: 420, overflowY: "auto" }}>
-              <table>
-                <thead><tr>
-                  <th className="left">Order</th><th className="left">Month</th>
-                  <th className="left">Status change</th><th className="num">GP was</th>
-                  <th className="num">GP now</th><th className="num">Change</th><th className="left">Reason</th>
-                </tr></thead>
-                <tbody>
-                  {shownFlagged.slice(0, 100).map((r, i) => {
-                    const delta = (r.now || 0) - (r.was || 0);
-                    return (
-                      <tr key={i} style={{ background: r.reason.includes("Removed") ? "#f7c8c2"
-                        : r.reason.includes("red") ? "#fbd5cf"
-                          : r.reason.includes("status") ? "#fde2dd"
-                            : r.reason.includes("Value") ? "#fdecea" : undefined }}>
-                        <td className="left">
-                          <div className="mono">{r.orderNum || r.netsuiteRef || "-"}</div>
-                          <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.company || "-"}</div>
-                          <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.partner || "-"}</div>
-                        </td>
-                        <td className="left">{periodLabel(r.mk)}</td>
-                        <td className="left">
-                          {(r.wasStatus != null && String(r.wasStatus) !== String(r.status)) || (r.wasCat && r.wasCat !== r.cat) ? (
-                            <>
-                              <div style={{ fontSize: 10.5, color: "#8a8aa3" }}>was</div>
-                              <div>
-                                <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat || "-"}</span>{" "}
-                                <span style={{ fontSize: 11 }}>{r.wasStatus || "-"}</span>
-                              </div>
-                              <div style={{ fontSize: 10.5, color: "#8a8aa3", marginTop: 3 }}>now</div>
-                              <div>
-                                <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat || "-"}</span>{" "}
-                                <span style={{ fontSize: 11 }}>{r.status || "-"}</span>
-                              </div>
-                            </>
-                          ) : (
-                            <>
-                              <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
-                              <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
-                            </>
-                          )}
-                        </td>
-                        <td className="num mono">{r.was == null ? "-" : gbp0(r.was)}</td>
-                        <td className="num mono">{gbp0(r.now)}</td>
-                        <td className={"num mono " + (delta >= 0 ? "pos" : "neg")}>{delta > 0 ? "+" : ""}{gbp0(delta)}</td>
-                        <td className="left">{r.reason}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-              {shownFlagged.length > 100 && <p className="note">Showing 100 of {shownFlagged.length} — use Export for the full list.</p>}
-            </div>
-          )}
-        </div>
-
+      <div className="two34" style={{ marginTop: 14 }}>
         <div>
           <div className="panel">
-            <h2>Commission pay control</h2>
-            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 8 }}>
-              <div className="step"><span className="n">1</span>
-                <div><div className="sub" style={{ margin: 0 }}>Total payable GP</div>
-                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(catTotals.payable)}</strong></div>
-              </div>
-              <span style={{ color: "#c9c6da" }}>›</span>
-              <div className="step"><span className="n">2</span>
-                <div><div className="sub" style={{ margin: 0 }}>Total paid from BT</div>
-                  <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.btPaidUs)}</strong></div>
-              </div>
-              <span style={{ color: "#c9c6da" }}>›</span>
-              <div className="step"><span className="n">3</span>
-                <div><div className="sub" style={{ margin: 0 }}>Remaining to be paid</div>
-                  <strong className="mono" style={{ fontSize: 16, color: catTotals.payable - pay.btPaidUs > 0 ? "#b3261e" : "#14804a" }}>
-                    {gbp0(catTotals.payable - pay.btPaidUs)}
-                  </strong></div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <h2 style={{ margin: 0 }}>
+                Monthly {mode === "gp" ? "GP" : "SOV"} position{cYear != null ? ` — ${fyLabel(cYear)}` : ""}
+              </h2>
+              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                {[["gp", "GP"], ["sov", "SOV"]].map(([v, l]) => (
+                  <button key={v} className={"tab " + (mode === v ? "active" : "")}
+                    style={{ padding: "5px 14px", fontSize: 12.5 }} onClick={() => setMode(v)}>{l}</button>
+                ))}
               </div>
             </div>
-            <p className="note">
-              Payable GP uses the tone categories; paid comes from Cobra's Commission Paid.
-            </p>
+            <div className="legend" style={{ marginTop: 10 }}>
+              {SERIES.map(([kk, c, l]) => <span key={kk}><i style={{ background: c }} />{l}</span>)}
+            </div>
+            {monthly.length === 0 ? <div className="empty">No dated rows yet.</div> : (
+              <div style={{ overflowX: "auto" }}>
+                <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 520, height: 240 }}>
+                  {[0, 0.25, 0.5, 0.75, 1].map((f) => (
+                    <g key={f}>
+                      <line x1={padL} x2={W - 4} y1={y(niceMax * f)} y2={y(niceMax * f)} stroke="#eceaf4" />
+                      <text x={padL - 6} y={y(niceMax * f) + 3} textAnchor="end" fontSize="9" fill="#8a8aa3">
+                        {Math.round((niceMax * f) / 1000)}K
+                      </text>
+                    </g>
+                  ))}
+                  {monthly.map((d, i) => (
+                    <g key={d.p}>
+                      {SERIES.map(([kk, c], j) => {
+                        const n = SERIES.length, slot = (bw - 8) / n;
+                        const h = Math.max(0, y(0) - y(d[kk]));
+                        return <rect key={kk} x={padL + i * bw + 4 + j * slot} y={y(d[kk])}
+                          width={Math.max(2, slot - 2)} height={h} fill={c} rx="1.5" />;
+                      })}
+                      <text x={padL + i * bw + bw / 2} y={H - 8} textAnchor="middle" fontSize="9" fill="#8a8aa3">
+                        {MONTHS_FY[i][1]}
+                      </text>
+                    </g>
+                  ))}
+                </svg>
+              </div>
+            )}
+            {mode === "sov" && (
+              <p className="note">
+                Sch5 SOV counts only rows flagged Y in{" "}
+                <span className="mono">{flagCol || "(no flag column found)"}</span>
+                {flagCol && flagCol !== "SCH5 ORDER" ? " — no \"Sch5 Order\" column in this export, so this is the closest match." : ""}
+              </p>
+            )}
           </div>
 
+
           <div className="panel">
-            <h2>Changes since snapshot</h2>
-            {!snapshot ? (
-              <div className="empty" style={{ padding: 20 }}>No snapshot locked yet. Lock one to start tracking movement.</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <h2 style={{ margin: 0 }}>Flagged orders from payroll updates <span className="sub">({flagged.length})</span></h2>
+              {flagged.length > 0 && (
+                <button className="btn" onClick={() => downloadCSV(flagged.map((r) => ({
+                  Month: periodLabel(r.mk), "Order ref": r.orderNum || "", "NetSuite ref": r.netsuiteRef || "",
+                  Company: r.company || "", Partner: r.partner || "", Item: r.product || "",
+                  "Status was": r.wasStatus || "", "Status now": r.status || "",
+                  "Category was": r.wasCat || "", "Category now": r.cat || "",
+                  "GP was": r.was ?? "", "GP now": r.now ?? "", Reason: r.reason,
+                })), "flagged-orders.csv")}>Export</button>
+              )}
+            </div>
+            {flagged.length > 0 && <ChangeFilters rows={flagged} value={flagFilter} onChange={setFlagFilter} />}
+            {flagged.length > 0 && (() => {
+              const t = { was: 0, now: 0 };
+              for (const r of shownFlagged) { t.was += r.was || 0; t.now += r.now || 0; }
+              const counts = shownFlagged.reduce((m, r) => { m[r.reason] = (m[r.reason] || 0) + 1; return m; }, {});
+              return (
+                <div style={{ overflowX: "auto", marginTop: 10, marginBottom: 4 }}>
+                  <table>
+                    <thead><tr>
+                      <th className="left">Flagged total</th>
+                      <th className="num">GP at payroll</th><th className="num">GP now</th><th className="num">Difference</th>
+                    </tr></thead>
+                    <tbody>
+                      <tr>
+                        <td className="left">{shownFlagged.length} order{shownFlagged.length === 1 ? "" : "s"}</td>
+                        <td className="num mono">{gbp0(t.was)}</td>
+                        <td className="num mono">{gbp0(t.now)}</td>
+                        <td className={"num mono " + (t.now - t.was >= 0 ? "pos" : "neg")}>
+                          {t.now - t.was > 0 ? "+" : ""}{gbp0(t.now - t.was)}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                  <p className="note" style={{ marginTop: 6 }}>
+                    {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}: ${n}`).join(" · ")}
+                  </p>
+                </div>
+              );
+            })()}
+            {flagged.length === 0 ? (
+              <div className="empty">
+                {Object.keys(statics).length === 0
+                  ? <>No month-end snapshots uploaded for this year yet — add them under <strong>Settings → Monthly Reports</strong> to see what has moved since payroll.</>
+                  : "Nothing has changed since the payroll snapshots."}
+              </div>
             ) : (
-              <table>
-                <tbody>
-                  {[["Total GP Change", changes.total], ["Total Payable Change", changes.payable],
-                    ["Total Issued Change", changes.issued]].map(([l, v]) => (
-                    <tr key={l}>
-                      <td className="left">{l}</td>
-                      <td className={"num mono " + (v === 0 ? "" : v > 0 ? "pos" : "neg")}>
-                        {v > 0 ? "+" : ""}{gbp0(v)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <div style={{ overflowX: "auto", marginTop: 10, maxHeight: 420, overflowY: "auto" }}>
+                <table>
+                  <thead><tr>
+                    <th className="left">Order</th><th className="left">Month</th>
+                    <th className="left">Status change</th><th className="num">GP was</th>
+                    <th className="num">GP now</th><th className="num">Change</th><th className="left">Reason</th>
+                  </tr></thead>
+                  <tbody>
+                    {shownFlagged.slice(0, 100).map((r, i) => {
+                      const delta = (r.now || 0) - (r.was || 0);
+                      return (
+                        <tr key={i} style={{ background: r.reason.includes("Removed") ? "#f7c8c2"
+                          : r.reason.includes("red") ? "#fbd5cf"
+                            : r.reason.includes("status") ? "#fde2dd"
+                              : r.reason.includes("Value") ? "#fdecea" : undefined }}>
+                          <td className="left">
+                            <div className="mono">{r.orderNum || r.netsuiteRef || "-"}</div>
+                            <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.company || "-"}</div>
+                            <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.partner || "-"}</div>
+                          </td>
+                          <td className="left">{periodLabel(r.mk)}</td>
+                          <td className="left">
+                            {(r.wasStatus != null && String(r.wasStatus) !== String(r.status)) || (r.wasCat && r.wasCat !== r.cat) ? (
+                              <>
+                                <div style={{ fontSize: 10.5, color: "#8a8aa3" }}>was</div>
+                                <div>
+                                  <span className="chip" style={CAT_STYLE[r.wasCat] || {}}>{r.wasCat || "-"}</span>{" "}
+                                  <span style={{ fontSize: 11 }}>{r.wasStatus || "-"}</span>
+                                </div>
+                                <div style={{ fontSize: 10.5, color: "#8a8aa3", marginTop: 3 }}>now</div>
+                                <div>
+                                  <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat || "-"}</span>{" "}
+                                  <span style={{ fontSize: 11 }}>{r.status || "-"}</span>
+                                </div>
+                              </>
+                            ) : (
+                              <>
+                                <span className="chip" style={CAT_STYLE[r.cat] || {}}>{r.cat}</span>
+                                <div className="sub" style={{ margin: 0, fontSize: 10.5 }}>{r.status || "-"}</div>
+                              </>
+                            )}
+                          </td>
+                          <td className="num mono">{r.was == null ? "-" : gbp0(r.was)}</td>
+                          <td className="num mono">{gbp0(r.now)}</td>
+                          <td className={"num mono " + (delta >= 0 ? "pos" : "neg")}>{delta > 0 ? "+" : ""}{gbp0(delta)}</td>
+                          <td className="left">{r.reason}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {shownFlagged.length > 100 && <p className="note">Showing 100 of {shownFlagged.length} — use Export for the full list.</p>}
+              </div>
             )}
-            {snapshot && <p className="note">Locked {new Date(snapshot.at).toLocaleString("en-GB")}.</p>}
           </div>
+        </div>
+        <div>
+          <div className="panel">
+            <h2>NetSuite vs Cobra</h2>
+            <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+              <Donut matched={k.pctMatched} review={0} exception={k.pctException} />
+              <div style={{ fontSize: 13 }}>
+                {[["Matched", k.pctMatched, "#14804a", k.nMatched],
+                  ["Mismatch", k.pctException, "#b3261e", k.nException]].map(([l, v, c, n]) => (
+                  <div key={l} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <i style={{ width: 10, height: 10, borderRadius: "50%", background: c, display: "inline-block" }} />
+                    <span style={{ minWidth: 78 }}>{l}</span>
+                    <strong className="mono">{v.toFixed(1)}%</strong>
+                    <span className="sub" style={{ margin: 0 }}>({n})</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+            <div className="panel">
+              <h2>Commission pay control</h2>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginTop: 8 }}>
+                <div className="step"><span className="n">1</span>
+                  <div><div className="sub" style={{ margin: 0 }}>Total payable GP</div>
+                    <strong className="mono" style={{ fontSize: 16 }}>{gbp0(catTotals.payable)}</strong></div>
+                </div>
+                <span style={{ color: "#c9c6da" }}>›</span>
+                <div className="step"><span className="n">2</span>
+                  <div><div className="sub" style={{ margin: 0 }}>Total paid from BT</div>
+                    <strong className="mono" style={{ fontSize: 16 }}>{gbp0(pay.btPaidUs)}</strong></div>
+                </div>
+                <span style={{ color: "#c9c6da" }}>›</span>
+                <div className="step"><span className="n">3</span>
+                  <div><div className="sub" style={{ margin: 0 }}>Remaining to be paid</div>
+                    <strong className="mono" style={{ fontSize: 16, color: catTotals.payable - pay.btPaidUs > 0 ? "#b3261e" : "#14804a" }}>
+                      {gbp0(catTotals.payable - pay.btPaidUs)}
+                    </strong></div>
+                </div>
+              </div>
+              <p className="note">
+                Payable GP uses the tone categories; paid comes from Cobra's Commission Paid.
+              </p>
+            </div>
+
+            <div className="panel">
+              <h2>Changes since snapshot</h2>
+              {!snapshot ? (
+                <div className="empty" style={{ padding: 20 }}>No snapshot locked yet. Lock one to start tracking movement.</div>
+              ) : (
+                <table>
+                  <tbody>
+                    {[["Total GP Change", changes.total], ["Total Payable Change", changes.payable],
+                      ["Total Issued Change", changes.issued]].map(([l, v]) => (
+                      <tr key={l}>
+                        <td className="left">{l}</td>
+                        <td className={"num mono " + (v === 0 ? "" : v > 0 ? "pos" : "neg")}>
+                          {v > 0 ? "+" : ""}{gbp0(v)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              {snapshot && <p className="note">Locked {new Date(snapshot.at).toLocaleString("en-GB")}.</p>}
+            </div>
         </div>
       </div>
     </>
