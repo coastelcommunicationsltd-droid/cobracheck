@@ -3,7 +3,7 @@ import * as XLSX from "xlsx";
 import { createClient } from "@supabase/supabase-js";
 
 /* =========================================================================
-   Commission Reconciliation — shared, login-gated version
+   BTLB Cheques and Balances — shared, login-gated commission reconciliation
    Sources: Cobra (what BT paid) · NetSuite (what we expect/recorded) · Sch5 (BT source feed)
    Join key: BT order number  (Cobra "Job Header" = NetSuite "Order ref" = Sch5 "MAIN ORDER NUM")
    Data is uploaded once and saved to Supabase, so everyone signed in sees the same view.
@@ -33,6 +33,10 @@ const makeSignupClient = () =>
 // fallback passcode — ONLY used if Supabase isn't configured yet (local testing)
 const PASSCODE = "BTLBDCSDTEST";
 const APP_VERSION = "2026-08-12-uk-dates";
+const APP_NAME = "BTLB Cheques and Balances";
+const PAGE_TITLE = "Cheques and Balances";
+// BT roundel, transparent background — inlined so nothing extra needs deploying
+const FAVICON = "data:image/png;base64,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";
 
 // ---------- helpers ----------
 const money = (v) => {
@@ -729,6 +733,14 @@ export default function ReconciliationTool() {
   const [errors, setErrors] = useState({});
   const [tab, setTab] = useState("overview");
   const [tabPending, startTabChange] = useTransition();
+
+  useEffect(() => {
+    document.title = PAGE_TITLE;
+    let link = document.querySelector("link[rel~='icon']");
+    if (!link) { link = document.createElement("link"); link.rel = "icon"; document.head.appendChild(link); }
+    link.type = "image/png";
+    link.href = FAVICON;
+  }, []);
   const goTab = useCallback((k) => startTabChange(() => setTab(k)), []);
   const [expanded, setExpanded] = useState(new Set());
   const [session, setSession] = useState(null);
@@ -1109,8 +1121,9 @@ export default function ReconciliationTool() {
       return (
         <div className="recon"><style>{STYLES}</style>
           <div className="lock panel">
-            <h1 style={{ margin: 0, fontSize: 20 }}>
-              Commission <span style={{ color: "#5514b4" }}>Reconciliation</span>
+            <h1 style={{ margin: 0, fontSize: 20, display: "flex", alignItems: "center", gap: 9 }}>
+              <img src={FAVICON} alt="" width="26" height="26" />
+              BTLB <span style={{ color: "#5514b4" }}>Cheques and Balances</span>
             </h1>
             <p className="sub" style={{ margin: "6px 0 0" }}>
               Sign in to view the shared reconciliation.
@@ -1144,7 +1157,7 @@ export default function ReconciliationTool() {
         <style>{STYLES}</style>
         <div className="lock panel">
           <h1 style={{ margin: 0, fontSize: 20 }}>
-            Commission <span style={{ color: "#5514b4" }}>Reconciliation</span>
+            BTLB <span style={{ color: "#5514b4" }}>Cheques and Balances</span>
           </h1>
           <p className="sub" style={{ margin: "6px 0 0" }}>Restricted test tool. Enter the access code.</p>
           <p className="sub" style={{ margin: "6px 0 0", color: "#b3261e" }}>
@@ -1182,7 +1195,10 @@ export default function ReconciliationTool() {
       <style>{STYLES}</style>
       <div className="shell">
         <nav className="sidebar">
-          <div className="brand">BT Payment &amp; Commission Reconciliation</div>
+          <div className="brand">
+            <img src={FAVICON} alt="" width="20" height="20" style={{ verticalAlign: "-4px", marginRight: 8 }} />
+            {APP_NAME}
+          </div>
           {NAV.map(([k, l, ic]) => (
             <button key={k} className={"navi " + (tab === k ? "on" : "")} onClick={() => goTab(k)}>
               <span className="ic">{ic}</span><span className="lbl2">{l}</span>
@@ -2467,6 +2483,25 @@ function AgentPayments({ files, settings, saveSettings, staffNames = [], dbPlans
   }, [shownAgents, keys.join(), monthlyPlans, payplans, dbPlansByMonth, paidMarks]);
 
   if (year == null) return <div className="empty panel">No dated NetSuite rows found.</div>;
+
+  // "Now payable" / "No longer payable" / added / removed per month, across the agents shown
+  const monthlyMoves = useMemo(() => {
+    const blank = keys.map(() => ({ gained: 0, lost: 0, nGained: 0, nLost: 0, added: 0, removed: 0, nAdded: 0, nRemoved: 0 }));
+    if (!Object.keys(statics).length) return null;
+    const allow = new Set(shownAgents.map(([n]) => n));
+    for (const [bk, rows] of allChanges) {
+      const parts = bk.split("|");
+      const i = Number(parts.pop());
+      if (!allow.has(parts.join("|"))) continue;
+      for (const r of rows) {
+        if (r.becamePayable) { blank[i].gained += r.now || 0; blank[i].nGained++; }
+        if (r.lostPayable) { blank[i].lost += r.was || 0; blank[i].nLost++; }
+        if (r.change === "new") { blank[i].added += r.now || 0; blank[i].nAdded++; }
+        if (r.change === "removed") { blank[i].removed += r.was || 0; blank[i].nRemoved++; }
+      }
+    }
+    return blank;
+  }, [shownAgents, statics, keys.join(), allChanges]);
 
   // payable totals per month: what payroll saw vs what the live report says now
   const payableRows = useMemo(() => {
