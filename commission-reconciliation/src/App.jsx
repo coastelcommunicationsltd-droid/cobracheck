@@ -1,38 +1,16 @@
 import { useState, useMemo, useCallback, useEffect, useRef, useTransition, Fragment } from "react";
 import * as XLSX from "xlsx";
-import { createClient } from "@supabase/supabase-js";
+import { createApiSupabaseClient } from "./api";
 
+const supabase = createApiSupabaseClient();
 /* =========================================================================
    BTLB Cheques and Balances — shared, login-gated commission reconciliation
    Sources: Cobra (what BT paid) · NetSuite (what we expect/recorded) · Sch5 (BT source feed)
    Join key: BT order number  (Cobra "Job Header" = NetSuite "Order ref" = Sch5 "MAIN ORDER NUM")
-   Data is uploaded once and saved to Supabase, so everyone signed in sees the same view.
+   Data is uploaded once and saved to the self-hosted service, so everyone signed in sees the same view.
    ========================================================================= */
 
-// ============ PASTE YOUR SUPABASE DETAILS HERE ============
-// Both come from Supabase → Project Settings → API.
-// The anon key is SAFE to be public (Supabase designed it that way) — the real
-// protection is the login + the email allow-list you set up in the SQL step.
-// The URL below is already your existing project; just paste the anon key.
-const SUPABASE_URL = "https://xrekebgnubhjqtpllbcz.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhyZWtlYmdudWJoanF0cGxsYmN6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU0MDEyNDMsImV4cCI6MjEwMDk3NzI0M30.1MbG2AX63hFNvzZoZB56pjkOlW6Dq7s4U5mGaaJGi80";
-// ==========================================================
-
-const supabase =
-  SUPABASE_URL.startsWith("https://") && !SUPABASE_ANON_KEY.startsWith("PASTE")
-    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
-    : null;
-
-// a throwaway client for creating other people's logins WITHOUT signing the
-// admin out of their own session (signUp normally hijacks the current session)
-const makeSignupClient = () =>
-  createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false, storageKey: "recon-signup-temp" },
-  });
-
-// fallback passcode — ONLY used if Supabase isn't configured yet (local testing)
-const PASSCODE = "BTLBDCSDTEST";
-const APP_VERSION = "2026-08-12-uk-dates";
+const APP_VERSION = "2026-08-17-self-hosted";
 const APP_NAME = "BTLB Cheques and Balances";
 const PAGE_TITLE = "Cheques and Balances";
 // BT roundel, transparent background — inlined so nothing extra needs deploying
@@ -752,8 +730,6 @@ function Delta({ v }) {
 }
 
 export default function ReconciliationTool() {
-  const [unlocked, setUnlocked] = useState(false);
-  const [pass, setPass] = useState("");
   const [files, setFiles] = useState({ cobra: null, netsuite: null, sch5: null });
   const [errors, setErrors] = useState({});
   const [tab, setTab] = useState("overview");
@@ -778,10 +754,14 @@ export default function ReconciliationTool() {
   const [saveProgress, setSaveProgress] = useState(null);
   const [loadProgress, setLoadProgress] = useState(null);
   const [period, setPeriod] = useState("all");
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [cobraAccess, setCobraAccess] = useState(null);
+  const isAdmin = cobraAccess?.isAdmin === true;
   const [users, setUsers] = useState([]);
-  const [newUser, setNewUser] = useState({ email: "", password: "" });
+  const [newUser, setNewUser] = useState({ email: "" });
   const [userMsg, setUserMsg] = useState(null);
+  const [forcedPassword, setForcedPassword] = useState("");
+  const [forcedPassword2, setForcedPassword2] = useState("");
+  const [forcedPasswordMsg, setForcedPasswordMsg] = useState(null);
   // shared settings: risk levels per order status, agent payplans, paid marks, WIP manual rows.
   // Stored as a second row (id='settings') in the SAME table — no database change needed.
   const [settings, setSettings] = useState({ risk: {}, payplans: {}, paidMarks: {}, wip: {} });
@@ -960,9 +940,8 @@ export default function ReconciliationTool() {
   const snapshot = settings.snapshot || null;
   const saveSnapshot = useCallback((snap) => saveSettings({ ...settings, snapshot: snap }), [settings, saveSettings]);
 
-  // track the logged-in session
+  // Track the logged-in session through the self-hosted API.
   useEffect(() => {
-    if (!supabase) { setAuthReady(true); return; }
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
       setAuthReady(true);
@@ -970,6 +949,26 @@ export default function ReconciliationTool() {
     const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s));
     return () => sub.subscription.unsubscribe();
   }, []);
+
+  // Authentication and CobraCheck authorisation are deliberately separate:
+  // a valid SchThrive account still needs an entry in recon_allowlist.
+  useEffect(() => {
+    let cancelled = false;
+    if (!session) {
+      setCobraAccess(null);
+      return () => { cancelled = true; };
+    }
+    setCobraAccess(null);
+    supabase.cobraAccess().then(({ data, error }) => {
+      if (cancelled) return;
+      if (error || !data?.allowed) {
+        setCobraAccess({ allowed: false, isAdmin: false, error: error?.message || "CobraCheck access is not enabled for this account." });
+      } else {
+        setCobraAccess({ allowed: true, isAdmin: data.isAdmin === true, error: null });
+      }
+    });
+    return () => { cancelled = true; };
+  }, [session]);
 
   // once signed in, load the shared dataset so everyone sees the same thing
   useEffect(() => {
@@ -1004,36 +1003,33 @@ export default function ReconciliationTool() {
     return () => { cancelled = true; };
   }, [session]);
 
-  // work out if the signed-in user is an admin, and load the user list
+  // Load the CobraCheck allow-list. Administrator status itself comes from
+  // /api/cobra/access, so the browser never decides its own privileges.
   const loadUsers = useCallback(async () => {
-    if (!supabase || !session) return;
-    const { data } = await supabase.from("recon_allowlist").select("email, is_admin").order("email");
-    if (data) {
-      setUsers(data);
-      const me = (session.user?.email || "").toLowerCase();
-      setIsAdmin(data.some((u) => (u.email || "").toLowerCase() === me && u.is_admin));
-    }
-  }, [session]);
+    if (!session || !cobraAccess?.allowed) return;
+    const { data, error } = await supabase.from("recon_allowlist").select("email, is_admin").order("email");
+    if (!error && data) setUsers(data);
+  }, [session, cobraAccess?.allowed]);
 
   useEffect(() => { loadUsers(); }, [loadUsers]);
 
-  // admin: create a login (email + password) and add them to the allow-list
+  // Admin: grant CobraCheck access to an EXISTING local account. Account
+  // creation remains in SchThrive administration so adding Cobra access can
+  // never accidentally create a broader SchThrive account/role.
   const addUser = useCallback(async () => {
     setUserMsg(null);
     const em = newUser.email.trim().toLowerCase();
-    const pw = newUser.password;
-    if (!em || pw.length < 6) { setUserMsg({ err: true, text: "Enter an email and a password of at least 6 characters." }); return; }
-    // create the auth account on a throwaway client so it doesn't sign you out
-    const tmp = makeSignupClient();
-    const { error: sErr } = await tmp.auth.signUp({ email: em, password: pw });
-    if (sErr && !/already registered/i.test(sErr.message)) {
-      setUserMsg({ err: true, text: sErr.message }); return;
+    if (!em) {
+      setUserMsg({ err: true, text: "Enter the email address of an existing account." });
+      return;
     }
-    // add to the allow-list so they can actually see the data
-    const { error: aErr } = await supabase.from("recon_allowlist").upsert({ email: em }, { onConflict: "email" });
-    if (aErr) { setUserMsg({ err: true, text: "Account made, but couldn't add to the allow-list: " + aErr.message }); return; }
-    setNewUser({ email: "", password: "" });
-    setUserMsg({ err: false, text: `${em} can now sign in with that password.` });
+    const { data, error } = await supabase.addCobraUser(em);
+    if (error) {
+      setUserMsg({ err: true, text: error.message });
+      return;
+    }
+    setNewUser({ email: "" });
+    setUserMsg({ err: false, text: `${data.email} now has CobraCheck access.` });
     loadUsers();
   }, [newUser, loadUsers]);
 
@@ -1135,80 +1131,119 @@ export default function ReconciliationTool() {
     });
 
   // ----- access gate -----
-  if (supabase) {
-    if (!authReady) {
-      return (
-        <div className="recon"><style>{STYLES}</style>
-          <div className="lock panel"><p className="sub">Loading…</p></div>
-        </div>
-      );
-    }
-    if (!session) {
-      const signIn = async () => {
-        setAuthMsg(null);
-        const { error } = await supabase.auth.signInWithPassword({
-          email: email.trim(),
-          password,
-        });
-        if (error) setAuthMsg({ err: true, text: "Email or password not recognised." });
-      };
-      return (
-        <div className="recon"><style>{STYLES}</style>
-          <div className="lock panel">
-            <h1 style={{ margin: 0, fontSize: 20, display: "flex", alignItems: "center", gap: 9 }}>
-              <img src={FAVICON} alt="" width="26" height="26" />
-              BTLB <span style={{ color: "#5514b4" }}>Cheques and Balances</span>
-            </h1>
-            <p className="sub" style={{ margin: "6px 0 0" }}>
-              Sign in to view the shared reconciliation.
-            </p>
-            <input
-              type="email"
-              value={email}
-              placeholder="Email"
-              onChange={(e) => setEmail(e.target.value)}
-            />
-            <input
-              type="password"
-              value={password}
-              placeholder="Password"
-              onChange={(e) => setPassword(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && email.trim() && password && signIn()}
-            />
-            <button onClick={() => email.trim() && password && signIn()}>Sign in</button>
-            {authMsg && (
-              <p className="sub" style={{ color: authMsg.err ? "#b3261e" : "#14804a", marginTop: 10 }}>{authMsg.text}</p>
-            )}
-          </div>
-        </div>
-      );
-    }
+  if (!authReady) {
+    return (
+      <div className="recon"><style>{STYLES}</style>
+        <div className="lock panel"><p className="sub">Loading…</p></div>
+      </div>
+    );
   }
 
-  if (!supabase && !unlocked) {
+  if (!session) {
+    const signIn = async () => {
+      setAuthMsg(null);
+      const { error } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
+      if (error) setAuthMsg({ err: true, text: "Email or password not recognised." });
+    };
     return (
-      <div className="recon">
-        <style>{STYLES}</style>
+      <div className="recon"><style>{STYLES}</style>
         <div className="lock panel">
-          <h1 style={{ margin: 0, fontSize: 20 }}>
+          <h1 style={{ margin: 0, fontSize: 20, display: "flex", alignItems: "center", gap: 9 }}>
+            <img src={FAVICON} alt="" width="26" height="26" />
             BTLB <span style={{ color: "#5514b4" }}>Cheques and Balances</span>
           </h1>
-          <p className="sub" style={{ margin: "6px 0 0" }}>Restricted test tool. Enter the access code.</p>
-          <p className="sub" style={{ margin: "6px 0 0", color: "#b3261e" }}>
-            Not connected to the database — this is local-only mode (no logins, uploads won't be saved or shared).
-            To turn on email/password logins + sharing, paste your Supabase anon key into App.jsx.
+          <p className="sub" style={{ margin: "6px 0 0" }}>
+            Sign in to view the shared reconciliation.
           </p>
           <input
-            type="password"
-            value={pass}
-            placeholder="Access code"
-            onChange={(e) => setPass(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && pass === PASSCODE && setUnlocked(true)}
+            type="email"
+            value={email}
+            placeholder="Email"
+            onChange={(e) => setEmail(e.target.value)}
           />
-          <button onClick={() => pass === PASSCODE && setUnlocked(true)}>Unlock</button>
-          {pass && pass !== PASSCODE && (
-            <p className="sub" style={{ color: "#b3261e", marginTop: 10 }}>That code isn't right.</p>
+          <input
+            type="password"
+            value={password}
+            placeholder="Password"
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && email.trim() && password && signIn()}
+          />
+          <button onClick={() => email.trim() && password && signIn()}>Sign in</button>
+          {authMsg && (
+            <p className="sub" style={{ color: authMsg.err ? "#b3261e" : "#14804a", marginTop: 10 }}>{authMsg.text}</p>
           )}
+        </div>
+      </div>
+    );
+  }
+
+  if (session.user?.must_change_password) {
+    const setFirstPassword = async () => {
+      setForcedPasswordMsg(null);
+      if (forcedPassword.length < 10) {
+        setForcedPasswordMsg({ err: true, text: "Password must be at least 10 characters." });
+        return;
+      }
+      if (forcedPassword !== forcedPassword2) {
+        setForcedPasswordMsg({ err: true, text: "The two passwords do not match." });
+        return;
+      }
+      const { error } = await supabase.auth.updateUser({ password: forcedPassword });
+      if (error) {
+        setForcedPasswordMsg({ err: true, text: error.message });
+        return;
+      }
+      setForcedPassword("");
+      setForcedPassword2("");
+      setForcedPasswordMsg({ err: false, text: "Password updated." });
+    };
+    return (
+      <div className="recon"><style>{STYLES}</style>
+        <div className="lock panel">
+          <h1 style={{ margin: 0, fontSize: 20 }}>Choose a new password</h1>
+          <p className="sub">You must replace the temporary password before using CobraCheck.</p>
+          <input
+            type="password"
+            value={forcedPassword}
+            placeholder="New password (at least 10 characters)"
+            onChange={(e) => setForcedPassword(e.target.value)}
+          />
+          <input
+            type="password"
+            value={forcedPassword2}
+            placeholder="Confirm new password"
+            onChange={(e) => setForcedPassword2(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && setFirstPassword()}
+          />
+          <button onClick={setFirstPassword}>Set password</button>
+          {forcedPasswordMsg && (
+            <p className="sub" style={{ color: forcedPasswordMsg.err ? "#b3261e" : "#14804a", marginTop: 10 }}>
+              {forcedPasswordMsg.text}
+            </p>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (cobraAccess === null) {
+    return (
+      <div className="recon"><style>{STYLES}</style>
+        <div className="lock panel"><p className="sub">Checking CobraCheck access…</p></div>
+      </div>
+    );
+  }
+
+  if (!cobraAccess.allowed) {
+    return (
+      <div className="recon"><style>{STYLES}</style>
+        <div className="lock panel">
+          <h1 style={{ margin: 0, fontSize: 20 }}>Access not enabled</h1>
+          <p className="sub">{cobraAccess.error || "Your account is not on the CobraCheck Users list."}</p>
+          <button onClick={() => supabase.auth.signOut()}>Sign out</button>
         </div>
       </div>
     );
@@ -1254,9 +1289,9 @@ export default function ReconciliationTool() {
               {session.user?.email}{" · "}
               <a href="#" onClick={async (e) => {
                 e.preventDefault();
-                const np = window.prompt("Enter a new password (at least 6 characters):");
+                const np = window.prompt("Enter a new password (at least 10 characters):");
                 if (!np) return;
-                if (np.length < 6) { window.alert("Password must be at least 6 characters."); return; }
+                if (np.length < 10) { window.alert("Password must be at least 10 characters."); return; }
                 const { error } = await supabase.auth.updateUser({ password: np });
                 window.alert(error ? ("Couldn't change password: " + error.message) : "Password updated. Use it next time you sign in.");
               }} style={{ color: "#5514b4" }}>Change password</a>
@@ -1281,14 +1316,6 @@ export default function ReconciliationTool() {
           {saving && " · Saving…"}
           {errors.save && <span style={{ color: "#b3261e" }}> · {errors.save}</span>}
         </p>
-
-        {!supabase && (
-          <div className="banner">
-            <strong>Not connected to the database.</strong> Running in local mode — uploads work but are
-            <em> not saved or shared</em>, and there's no login. Paste your Supabase anon key into
-            <span className="mono"> App.jsx</span> (the <span className="mono">SUPABASE_ANON_KEY</span> line) and redeploy to switch on logins + sharing.
-          </div>
-        )}
 
         {/* controls: month + tolerance (only once there's data) */}
         {anyLoaded && tab !== "agents" && tab !== "wip" && (
@@ -1359,7 +1386,7 @@ export default function ReconciliationTool() {
         )}
 
         <p className="note" style={{ textAlign: "center", marginTop: 20 }}>
-          Access is limited to the emails in the Users list. Real commission data is stored in Supabase, protected by that list.
+          Access is limited to the emails in the Users list. Shared commission data is stored in the self-hosted service and protected by that list.
         </p>
         </div>
       </div>
@@ -3251,19 +3278,16 @@ function Settings(props) {
 
       {sub === "users" && isAdmin && (
         <div className="panel">
-          <h2>Users — who can sign in</h2>
+          <h2>Users — who can access CobraCheck</h2>
           <div className="banner info">
-            Add a person's email and a password here, then hand them those two things — that's how they sign in.
-            Only people in this list can see the data.
+            Add the email address of an existing SchThrive account to grant CobraCheck access.
+            Account creation and password management stay in SchThrive administration.
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 14 }}>
-            <input type="email" placeholder="Email" value={newUser.email}
-              onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
-              style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 220 }} />
-            <input type="text" placeholder="Password (min 6 chars)" value={newUser.password}
-              onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
-              style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 200 }} />
-            <button className="btn" style={{ background: "#5514b4", color: "#fff" }} onClick={addUser}>Add login</button>
+            <input type="email" placeholder="Existing account email" value={newUser.email}
+              onChange={(e) => setNewUser({ email: e.target.value })}
+              style={{ padding: "8px 10px", border: "1px solid #d3d0e6", borderRadius: 7, fontSize: 13, minWidth: 260 }} />
+            <button className="btn" style={{ background: "#5514b4", color: "#fff" }} onClick={addUser}>Grant access</button>
           </div>
           {userMsg && <p className="sub" style={{ color: userMsg.err ? "#b3261e" : "#14804a", marginTop: 0 }}>{userMsg.text}</p>}
           <table>
@@ -3282,7 +3306,7 @@ function Settings(props) {
               ))}
             </tbody>
           </table>
-          <p className="note">Removing someone stops them seeing the data. Password resets are done from Supabase.</p>
+          <p className="note">Removing someone stops them seeing CobraCheck data. Account creation and password resets are managed through SchThrive administration.</p>
         </div>
       )}
     </>
